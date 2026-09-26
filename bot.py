@@ -18,6 +18,8 @@ import re
 import shutil
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from playwright.async_api import async_playwright
@@ -77,10 +79,19 @@ SKIP_EXT = re.compile(r"\.(png|jpe?g|gif|webp|svg|css|woff2?|ttf|ico)(\?|$)", re
 
 
 async def find_video_url(video_id: str) -> dict:
-    """Kembalikan {'url', 'referer', 'cookies'} atau raise NotFound."""
+    """Kembalikan {'url', 'referer', 'kind', 'cookies'} atau raise NotFound."""
     page_url = f"https://vidmonstr.com/e/{video_id}"
-    found: dict = {}
+    cands: list[dict] = []  # semua link yang mungkin video
     seen: list[str] = []  # log request untuk diagnosis
+    first_hit: list[float] = []
+
+    def add(url: str, referer: str, how: str):
+        if url.startswith(("blob:", "data:")) or any(c["url"] == url for c in cands):
+            return
+        cands.append({"url": url, "referer": referer or page_url, "how": how})
+        if not first_hit:
+            first_hit.append(time.monotonic())
+        log.info("kandidat (%s): %s", how, url[:200])
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -89,19 +100,13 @@ async def find_video_url(video_id: str) -> dict:
         def on_request(req):
             if not SKIP_EXT.search(req.url):
                 seen.append(f"{req.resource_type[:5]:5} {req.url[:160]}")
-            if not found and VIDEO_RE.search(req.url):
-                found["url"] = req.url
-                found["referer"] = req.headers.get("referer") or page_url
-                log.info("video ditemukan (url): %s", req.url)
+            if VIDEO_RE.search(req.url):
+                add(req.url, req.headers.get("referer"), "url")
 
         def on_response(resp):
-            if found:
-                return
             ctype = (resp.headers.get("content-type") or "").lower()
             if any(t in ctype for t in VIDEO_TYPES):
-                found["url"] = resp.url
-                found["referer"] = resp.request.headers.get("referer") or page_url
-                log.info("video ditemukan (content-type %s): %s", ctype, resp.url)
+                add(resp.url, resp.request.headers.get("referer"), f"type {ctype[:30]}")
 
         ctx.on("request", on_request)
         ctx.on("response", on_response)
@@ -141,7 +146,10 @@ async def find_video_url(video_id: str) -> dict:
             pass
 
         deadline = time.monotonic() + SNIFF_TIMEOUT
-        while not found and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            # setelah kandidat pertama, tunggu 6 detik lagi untuk mengumpulkan kandidat lain
+            if first_hit and time.monotonic() - first_hit[0] > 6:
+                break
             for frame in page.frames:
                 try:
                     for sel in PLAY_SELECTORS:
@@ -158,16 +166,14 @@ async def find_video_url(video_id: str) -> dict:
                             return (s && !s.startsWith('blob:')) ? s : null;
                         }"""
                     )
-                    if src and not found:
-                        found["url"] = src
-                        found["referer"] = frame.url
+                    if src:
+                        add(src, frame.url, "video.src")
                 except Exception:
                     pass
-            if not found:
-                await asyncio.sleep(2)
+            await asyncio.sleep(2)
 
-        if "url" not in found:
-            # Kumpulkan data diagnosis sebelum browser ditutup.
+        # Kumpulkan data diagnosis sebelum browser ditutup (dipakai kalau gagal).
+        if True:
             shot = None
             try:
                 shot = await page.screenshot(type="jpeg", quality=60)
@@ -193,16 +199,59 @@ async def find_video_url(video_id: str) -> dict:
                 f"<video> src: {vids or 'tidak ada'}\n\n"
                 f"Request terakhir ({len(seen)} total):\n" + "\n".join(seen[-40:])
             )
-            await browser.close()
-            raise NotFound(
-                "Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis).",
-                shot, report,
-            )
-
-        found["cookies"] = await ctx.cookies()
+        cookies = await ctx.cookies()
         await browser.close()
 
-    return found
+    # Periksa isi tiap kandidat, pilih yang benar-benar video.
+    rank = {"hls": 0, "mp4": 1, "webm": 2, "ts": 3}
+    probes = []
+    for c in cands:
+        kind, detail = await asyncio.to_thread(probe, c["url"], c["referer"], cookies)
+        c["kind"] = kind
+        probes.append(f"[{kind}] ({c['how']}) {c['url'][:200]}\n    {detail}")
+    good = sorted((c for c in cands if c["kind"] in rank), key=lambda c: rank[c["kind"]])
+    if not good:
+        report = "Kandidat yang diperiksa:\n" + ("\n".join(probes) or "  (tidak ada)") + "\n\n" + report
+        raise NotFound(
+            "Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis).",
+            shot, report,
+        )
+    best = good[0]
+    log.info("dipilih [%s]: %s", best["kind"], best["url"][:200])
+    return {**best, "cookies": cookies, "report": "\n".join(probes)}
+
+
+def cookie_header(cookies: list, url: str) -> str:
+    host = urllib.parse.urlparse(url).hostname or ""
+    return "; ".join(
+        f"{c['name']}={c['value']}" for c in cookies
+        if host == c["domain"].lstrip(".") or host.endswith("." + c["domain"].lstrip("."))
+    )
+
+
+def probe(url: str, referer: str, cookies: list) -> tuple[str, str]:
+    """Ambil 4 KB pertama dan tebak jenisnya: hls / mp4 / webm / ts / bukan video."""
+    headers = {"User-Agent": USER_AGENT, "Referer": referer, "Range": "bytes=0-4095"}
+    ck = cookie_header(cookies, url)
+    if ck:
+        headers["Cookie"] = ck
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as r:
+            head = r.read(4096)
+            ctype = r.headers.get("content-type", "")
+            code = r.status
+    except Exception as e:
+        return "error", str(e)[:200]
+    detail = f"HTTP {code}, {ctype}, awal: {head[:80]!r}"
+    if head.lstrip(b"\xef\xbb\xbf").startswith(b"#EXTM3U"):
+        return "hls", detail
+    if head[4:8] == b"ftyp":
+        return "mp4", detail
+    if head.startswith(b"\x1aE\xdf\xa3"):
+        return "webm", detail
+    if head[:1] == b"G" and len(head) > 188 and head[188:189] == b"G":
+        return "ts", detail
+    return "bukan-video", detail
 
 
 def write_cookie_file(cookies: list, path: Path) -> None:
@@ -223,7 +272,29 @@ def write_cookie_file(cookies: list, path: Path) -> None:
 
 
 # ---------------------------------------------------------------- unduh
+async def download_hls(info: dict, workdir: Path) -> Path:
+    """Unduh playlist HLS pakai ffmpeg (-f hls: tetap jalan walau link tanpa .m3u8)."""
+    out = workdir / "video_ff.mp4"
+    hdr = f"Referer: {info['referer']}\r\n"
+    ck = cookie_header(info.get("cookies", []), info["url"])
+    if ck:
+        hdr += f"Cookie: {ck}\r\n"
+    try:
+        await run(
+            "ffmpeg", "-y", "-v", "error", "-user_agent", USER_AGENT, "-headers", hdr,
+            "-allowed_extensions", "ALL",
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+            "-f", "hls", "-i", info["url"],
+            "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", str(out),
+        )
+    except Exception as e:
+        raise RuntimeError(f"Unduhan HLS gagal: {str(e)[-400:]}")
+    return out
+
+
 async def download(info: dict, workdir: Path) -> Path:
+    if info.get("kind") == "hls":
+        return await download_hls(info, workdir)
     cookie_file = workdir / "cookies.txt"
     write_cookie_file(info.get("cookies", []), cookie_file)
     out_tpl = str(workdir / "video.%(ext)s")
@@ -232,19 +303,27 @@ async def download(info: dict, workdir: Path) -> Path:
         "--cookies", str(cookie_file),
         "--add-header", f"Referer:{info['referer']}",
         "--add-header", f"User-Agent:{USER_AGENT}",
-        "--merge-output-format", "mp4", "--remux-video", "mp4",
         "-o", out_tpl, info["url"],
     ]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     _, err = await proc.communicate()
-    if proc.returncode != 0:
+    files = sorted(f for f in workdir.glob("video.*") if f.stat().st_size > 0)
+
+    if proc.returncode != 0 or not files:
         raise RuntimeError(f"Unduhan gagal: {err.decode(errors='ignore')[-300:]}")
-    files = sorted(workdir.glob("video.*"))
-    if not files:
-        raise RuntimeError("Unduhan selesai tapi file tidak ditemukan.")
-    return files[0]
+
+    path = files[0]
+    if path.suffix.lower() != ".mp4":
+        mp4 = workdir / "video_remux.mp4"
+        try:
+            await run("ffmpeg", "-y", "-v", "error", "-i", str(path), "-c", "copy",
+                      "-movflags", "+faststart", str(mp4))
+            return mp4
+        except Exception as e:
+            log.warning("remux ke mp4 gagal, kirim apa adanya: %s", e)
+    return path
 
 
 # ---------------------------------------------------------------- ukuran besar: kompres / potong
@@ -353,6 +432,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text("⏳ Mencari video...")
     workdir = Path(tempfile.mkdtemp(prefix="vid_"))
+    info = None
     try:
         async with sem:
             info = await find_video_url(m.group(1))
@@ -387,7 +467,13 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(f, filename="diagnosis.txt")
     except Exception as e:
         log.exception("gagal")
-        await status.edit_text(f"❌ {e}")
+        await status.edit_text(f"❌ {str(e)[:900]}")
+        rpt_text = (info or {}).get("report")
+        if rpt_text:
+            rpt = Path(workdir) / "kandidat.txt"
+            rpt.write_text(rpt_text)
+            with rpt.open("rb") as f:
+                await update.message.reply_document(f, filename="kandidat.txt")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
