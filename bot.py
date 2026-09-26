@@ -52,7 +52,9 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 LINK_RE = re.compile(r"https?://(?:www\.)?vidmonstr\.com/(?:e|d)/([A-Za-z0-9]+)")
-VIDEO_RE = re.compile(r"\.(m3u8|mp4)(\?|$)", re.I)
+# .m3u8/.mp4 biasa, plus stream.php milik vidmonstr (player-nya mengambil video dari sini lalu
+# memutarnya lewat blob:, jadi link ini tidak berakhiran .mp4 dan tidak terlihat di <video>).
+VIDEO_RE = re.compile(r"\.(m3u8|mp4)(\?|$)|/stream\.php\?", re.I)
 # Selector tombol play yang umum di berbagai player (JW, Video.js, Plyr, dll.)
 PLAY_SELECTORS = [
     ".jw-icon-playback", ".jw-display-icon-container", ".vjs-big-play-button",
@@ -105,7 +107,7 @@ async def find_video_url(video_id: str) -> dict:
 
         def on_response(resp):
             ctype = (resp.headers.get("content-type") or "").lower()
-            if any(t in ctype for t in VIDEO_TYPES):
+            if any(t in ctype for t in VIDEO_TYPES) or resp.request.resource_type == "media":
                 add(resp.url, resp.request.headers.get("referer"), f"type {ctype[:30]}")
 
         ctx.on("request", on_request)
@@ -292,9 +294,40 @@ async def download_hls(info: dict, workdir: Path) -> Path:
     return out
 
 
+def http_download(info: dict, out: Path) -> None:
+    """Unduh file video langsung (dipakai untuk link seperti stream.php yang tidak dikenali yt-dlp)."""
+    headers = {"User-Agent": USER_AGENT, "Referer": info["referer"]}
+    ck = cookie_header(info.get("cookies", []), info["url"])
+    if ck:
+        headers["Cookie"] = ck
+    req = urllib.request.Request(info["url"], headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as r, out.open("wb") as f:
+        shutil.copyfileobj(r, f, 1024 * 1024)
+    if out.stat().st_size == 0:
+        raise RuntimeError("file kosong")
+
+
 async def download(info: dict, workdir: Path) -> Path:
-    if info.get("kind") == "hls":
+    kind = info.get("kind")
+    if kind == "hls":
         return await download_hls(info, workdir)
+    if kind in ("mp4", "webm", "ts"):
+        direct = workdir / f"direct.{kind}"
+        try:
+            await asyncio.to_thread(http_download, info, direct)
+            if kind == "mp4":
+                return direct
+            mp4 = workdir / "direct_remux.mp4"
+            try:
+                await run("ffmpeg", "-y", "-v", "error", "-i", str(direct), "-c", "copy",
+                          "-movflags", "+faststart", str(mp4))
+                return mp4
+            except Exception as e:
+                log.warning("remux ke mp4 gagal, kirim apa adanya: %s", e)
+                return direct
+        except Exception as e:
+            log.warning("unduh langsung gagal, coba yt-dlp: %s", e)
+            direct.unlink(missing_ok=True)
     cookie_file = workdir / "cookies.txt"
     write_cookie_file(info.get("cookies", []), cookie_file)
     out_tpl = str(workdir / "video.%(ext)s")
