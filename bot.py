@@ -1,0 +1,342 @@
+"""
+Bot Telegram: kirim link vidmonstr.com/e/... atau /d/... -> bot membalas file videonya.
+
+Cara kerja:
+1. Buka halaman embed pakai browser otomatis (Playwright/Chromium).
+2. Tutup tab iklan yang muncul, lalu "klik play" seperti user biasa.
+3. Rekam request jaringan untuk mencari link video (.m3u8 / .mp4).
+4. Unduh pakai yt-dlp (otomatis gabung m3u8 jadi mp4 via ffmpeg).
+5. Kirim ke Telegram.
+
+Tidak ada bypass captcha / penyamaran fingerprint. Kalau situs menolak, bot melapor gagal.
+"""
+
+import asyncio
+import logging
+import os
+import re
+import shutil
+import tempfile
+import time
+from pathlib import Path
+
+from playwright.async_api import async_playwright
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ---------------------------------------------------------------- konfigurasi
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+# Opsional: batasi siapa yang boleh pakai, contoh "12345,67890". Kosong = semua orang.
+ALLOWED = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()}
+# Opsional: alamat Local Bot API Server, contoh "http://localhost:8081". Kalau diisi, batas upload 2000 MB.
+BOT_API_URL = os.environ.get("BOT_API_URL", "").rstrip("/")
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if BOT_API_URL else "50"))
+# Video yang lebih besar dari batas tapi <= batas x rasio ini dikompres dulu; selebihnya dipotong.
+COMPRESS_RATIO = float(os.environ.get("COMPRESS_RATIO", "1.5"))
+MAX_PARTS = int(os.environ.get("MAX_PARTS", "20"))  # batas jumlah potongan per video
+MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "1"))
+SNIFF_TIMEOUT = int(os.environ.get("SNIFF_TIMEOUT", "40"))  # detik menunggu link video
+HEADLESS = os.environ.get("HEADLESS", "1") != "0"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+LINK_RE = re.compile(r"https?://(?:www\.)?vidmonstr\.com/(?:e|d)/([A-Za-z0-9]+)")
+VIDEO_RE = re.compile(r"\.(m3u8|mp4)(\?|$)", re.I)
+# Selector tombol play yang umum di berbagai player (JW, Video.js, Plyr, dll.)
+PLAY_SELECTORS = [
+    ".jw-icon-playback", ".jw-display-icon-container", ".vjs-big-play-button",
+    ".plyr__control--overlaid", ".play-button", "#play", "button[aria-label*=Play i]",
+]
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+log = logging.getLogger("vidbot")
+sem = asyncio.Semaphore(MAX_PARALLEL)
+
+
+# ---------------------------------------------------------------- cari link video
+async def find_video_url(video_id: str) -> dict:
+    """Kembalikan {'url', 'referer', 'cookies'} atau raise RuntimeError."""
+    page_url = f"https://vidmonstr.com/e/{video_id}"
+    found: dict = {}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=HEADLESS)
+        ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720})
+
+        def on_request(req):
+            if not found and VIDEO_RE.search(req.url):
+                found["url"] = req.url
+                found["referer"] = req.headers.get("referer") or page_url
+                log.info("video ditemukan: %s", req.url)
+
+        ctx.on("request", on_request)
+
+        page = await ctx.new_page()
+
+        # Tab iklan yang dibuka otomatis langsung ditutup.
+        async def close_popup(new_page):
+            if new_page != page:
+                try:
+                    await new_page.close()
+                except Exception:
+                    pass
+
+        ctx.on("page", lambda np: asyncio.ensure_future(close_popup(np)))
+
+        try:
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=30_000)
+        except Exception as e:
+            await browser.close()
+            raise RuntimeError(f"Gagal membuka halaman: {e}")
+
+        # Buang overlay iklan transparan lalu tampilkan iframe player (sama seperti klik thumbnail).
+        await page.evaluate(
+            """() => {
+                document.querySelectorAll('a[style*="position: fixed"], div[style*="opacity: 0.01"]')
+                    .forEach(el => el.remove());
+                const link = document.querySelector('.video-link');
+                if (link) link.click();
+                const f = document.getElementById('videq_iframe');
+                if (f) f.style.display = 'block';
+            }"""
+        )
+
+        deadline = time.monotonic() + SNIFF_TIMEOUT
+        while not found and time.monotonic() < deadline:
+            for frame in page.frames:
+                try:
+                    # Coba tombol play umum
+                    for sel in PLAY_SELECTORS:
+                        el = await frame.query_selector(sel)
+                        if el:
+                            await el.click(timeout=1500, force=True)
+                            break
+                    # Paksa <video> main (dibisukan agar autoplay diizinkan) + baca src langsung
+                    src = await frame.evaluate(
+                        """() => {
+                            const v = document.querySelector('video');
+                            if (!v) return null;
+                            v.muted = true; v.play().catch(()=>{});
+                            const s = v.currentSrc || v.src || (v.querySelector('source')||{}).src;
+                            return (s && !s.startsWith('blob:')) ? s : null;
+                        }"""
+                    )
+                    if src and not found:
+                        found["url"] = src
+                        found["referer"] = frame.url
+                except Exception:
+                    pass
+            if not found:
+                await asyncio.sleep(2)
+
+        found["cookies"] = await ctx.cookies()
+        await browser.close()
+
+    if "url" not in found:
+        raise RuntimeError("Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis).")
+    return found
+
+
+def write_cookie_file(cookies: list, path: Path) -> None:
+    """Simpan cookie browser ke format Netscape agar bisa dipakai yt-dlp."""
+    lines = ["# Netscape HTTP Cookie File"]
+    for c in cookies:
+        domain = c["domain"]
+        lines.append("\t".join([
+            domain,
+            "TRUE" if domain.startswith(".") else "FALSE",
+            c.get("path", "/"),
+            "TRUE" if c.get("secure") else "FALSE",
+            str(int(c.get("expires", 0)) if c.get("expires", -1) > 0 else 0),
+            c["name"],
+            c["value"],
+        ]))
+    path.write_text("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------- unduh
+async def download(info: dict, workdir: Path) -> Path:
+    cookie_file = workdir / "cookies.txt"
+    write_cookie_file(info.get("cookies", []), cookie_file)
+    out_tpl = str(workdir / "video.%(ext)s")
+    cmd = [
+        "yt-dlp", "--no-playlist", "--quiet", "--no-warnings",
+        "--cookies", str(cookie_file),
+        "--add-header", f"Referer:{info['referer']}",
+        "--add-header", f"User-Agent:{USER_AGENT}",
+        "--merge-output-format", "mp4", "--remux-video", "mp4",
+        "-o", out_tpl, info["url"],
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Unduhan gagal: {err.decode(errors='ignore')[-300:]}")
+    files = sorted(workdir.glob("video.*"))
+    if not files:
+        raise RuntimeError("Unduhan selesai tapi file tidak ditemukan.")
+    return files[0]
+
+
+# ---------------------------------------------------------------- ukuran besar: kompres / potong
+LIMIT_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+
+async def run(*cmd: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"{cmd[0]} gagal: {err.decode(errors='ignore')[-300:]}")
+    return out.decode(errors="ignore")
+
+
+async def duration_of(path: Path) -> float:
+    out = await run(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=nw=1:nk=1", str(path),
+    )
+    return float(out.strip())
+
+
+async def compress(path: Path, workdir: Path) -> Path:
+    """Encode ulang agar muat di batas upload (target 92% dari batas)."""
+    dur = await duration_of(path)
+    audio_kbps = 96
+    total_kbps = (LIMIT_BYTES * 0.92 * 8 / 1000) / dur
+    video_kbps = int(total_kbps - audio_kbps)
+    if video_kbps < 250:  # terlalu kecil -> gambar hancur, lebih baik dipotong
+        raise RuntimeError("bitrate terlalu rendah")
+    out = workdir / "compressed.mp4"
+    await run(
+        "ffmpeg", "-y", "-v", "error", "-i", str(path),
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
+        "-vf", "scale='min(1280,iw)':-2",
+        "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+        "-movflags", "+faststart", str(out),
+    )
+    return out
+
+
+async def split(path: Path, workdir: Path) -> list[Path]:
+    """Potong tanpa encode ulang. Kalau ada potongan yang masih kebesaran, ulangi dengan durasi lebih pendek."""
+    dur = await duration_of(path)
+    size = path.stat().st_size
+    seg = max(10.0, dur * (LIMIT_BYTES * 0.85) / size)
+    for _ in range(4):
+        if dur / seg > MAX_PARTS:
+            raise RuntimeError(f"Video terlalu besar (lebih dari {MAX_PARTS} bagian).")
+        partdir = workdir / "parts"
+        shutil.rmtree(partdir, ignore_errors=True)
+        partdir.mkdir()
+        await run(
+            "ffmpeg", "-y", "-v", "error", "-i", str(path),
+            "-c", "copy", "-map", "0", "-f", "segment",
+            "-segment_time", f"{seg:.2f}", "-reset_timestamps", "1",
+            "-segment_format_options", "movflags=+faststart",
+            str(partdir / "part%03d.mp4"),
+        )
+        parts = sorted(partdir.glob("part*.mp4"))
+        biggest = max(p.stat().st_size for p in parts)
+        if biggest <= LIMIT_BYTES:
+            return parts
+        seg *= (LIMIT_BYTES * 0.85) / biggest  # perkecil durasi sesuai potongan terbesar
+    raise RuntimeError("Gagal memotong video jadi ukuran yang muat.")
+
+
+async def fit_for_upload(path: Path, workdir: Path, status) -> list[Path]:
+    size = path.stat().st_size
+    if size <= LIMIT_BYTES:
+        return [path]
+    mb = size / 1024 / 1024
+    if size <= LIMIT_BYTES * COMPRESS_RATIO:
+        await status.edit_text(f"🗜️ Video {mb:.0f} MB, sedang dikompres...")
+        try:
+            small = await compress(path, workdir)
+            if small.stat().st_size <= LIMIT_BYTES:
+                return [small]
+        except Exception as e:
+            log.warning("kompres gagal, beralih ke potong: %s", e)
+    await status.edit_text(f"✂️ Video {mb:.0f} MB, sedang dipotong...")
+    return await split(path, workdir)
+
+
+# ---------------------------------------------------------------- handler telegram
+def allowed(update: Update) -> bool:
+    return not ALLOWED or (update.effective_user and update.effective_user.id in ALLOWED)
+
+
+async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Kirim link vidmonstr.com/e/... atau /d/..., nanti aku kirim videonya."
+    )
+
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    m = LINK_RE.search(update.message.text or "")
+    if not m:
+        await update.message.reply_text("Itu bukan link vidmonstr.")
+        return
+
+    status = await update.message.reply_text("⏳ Mencari video...")
+    workdir = Path(tempfile.mkdtemp(prefix="vid_"))
+    try:
+        async with sem:
+            info = await find_video_url(m.group(1))
+            await status.edit_text("⬇️ Mengunduh...")
+            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+            path = await download(info, workdir)
+
+        parts = await fit_for_upload(path, workdir, status)
+
+        total = len(parts)
+        for i, part in enumerate(parts, 1):
+            label = f"⬆️ Mengirim bagian {i}/{total}..." if total > 1 else "⬆️ Mengirim..."
+            await status.edit_text(label)
+            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+            with part.open("rb") as f:
+                await update.message.reply_video(
+                    f,
+                    caption=f"Bagian {i}/{total}" if total > 1 else None,
+                    supports_streaming=True,
+                    read_timeout=600, write_timeout=600,
+                )
+        await status.delete()
+    except Exception as e:
+        log.exception("gagal")
+        await status.edit_text(f"❌ {e}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def main():
+    builder = Application.builder().token(BOT_TOKEN)
+    if BOT_API_URL:
+        builder = (
+            builder.base_url(f"{BOT_API_URL}/bot")
+            .base_file_url(f"{BOT_API_URL}/file/bot")
+            .local_mode(True)
+        )
+    app = builder.build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    log.info("bot jalan (batas upload %d MB%s)", MAX_UPLOAD_MB, ", local API" if BOT_API_URL else "")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
