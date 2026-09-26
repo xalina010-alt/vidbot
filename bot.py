@@ -80,17 +80,63 @@ VIDEO_TYPES = ("mpegurl", "video/", "dash+xml")
 SKIP_EXT = re.compile(r"\.(png|jpe?g|gif|webp|svg|css|woff2?|ttf|ico)(\?|$)", re.I)
 
 
-async def find_video_url(video_id: str) -> dict:
+# Header yang tidak boleh ikut disalin saat meniru request browser.
+DROP_HEADERS = {"host", "content-length", "range", "accept-encoding", "connection"}
+BODY_TIMEOUT = int(os.environ.get("BODY_TIMEOUT", "300"))  # detik menunggu browser selesai memuat video
+
+
+async def grab_from_browser(c: dict, workdir: Path) -> None:
+    """Salin header asli request browser, dan kalau respons browser berisi video, simpan isinya.
+
+    Beberapa server (mis. stream.php vidmonstr) hanya memberi video ke request yang persis seperti
+    dari player, atau tokennya sekali pakai. Isi yang sudah diterima browser adalah jalan paling aman.
+    """
+    req = c.get("req")
+    if not req:
+        return
+    try:
+        hdrs = await req.all_headers()
+        c["headers"] = {k: v for k, v in hdrs.items()
+                        if not k.startswith(":") and k.lower() not in DROP_HEADERS}
+        c["referer"] = hdrs.get("referer") or c["referer"]
+    except Exception as e:
+        log.info("gagal membaca header request: %s", e)
+    try:
+        resp = await req.response()
+        if not resp:
+            c["browser"] = "tanpa respons"
+            return
+        ctype = resp.headers.get("content-type", "")
+        c["browser"] = f"HTTP {resp.status}, {ctype}"
+        body = await asyncio.wait_for(resp.body(), BODY_TIMEOUT)
+        kind = sniff(body[:4096])
+        c["browser"] += f", {len(body) / 1024 / 1024:.1f} MB, isi: {kind}"
+        if kind in ("mp4", "webm", "ts"):
+            f = workdir / f"browser.{kind}"
+            f.write_bytes(body)
+            c["body_file"] = str(f)
+            c["kind"] = kind
+        elif kind == "hls":
+            c["kind"] = "hls"
+    except Exception as e:
+        c["browser"] = c.get("browser", "") + f", isi tidak bisa diambil: {str(e)[:150]}"
+
+
+async def find_video_url(video_id: str, workdir: Path) -> dict:
     """Kembalikan {'url', 'referer', 'kind', 'cookies'} atau raise NotFound."""
     page_url = f"https://vidmonstr.com/e/{video_id}"
     cands: list[dict] = []  # semua link yang mungkin video
     seen: list[str] = []  # log request untuk diagnosis
     first_hit: list[float] = []
 
-    def add(url: str, referer: str, how: str):
-        if url.startswith(("blob:", "data:")) or any(c["url"] == url for c in cands):
+    def add(url: str, referer: str, how: str, req=None):
+        if url.startswith(("blob:", "data:")):
             return
-        cands.append({"url": url, "referer": referer or page_url, "how": how})
+        for c in cands:
+            if c["url"] == url:
+                c.setdefault("req", req) if req else None
+                return
+        cands.append({"url": url, "referer": referer or page_url, "how": how, "req": req})
         if not first_hit:
             first_hit.append(time.monotonic())
         log.info("kandidat (%s): %s", how, url[:200])
@@ -103,12 +149,12 @@ async def find_video_url(video_id: str) -> dict:
             if not SKIP_EXT.search(req.url):
                 seen.append(f"{req.resource_type[:5]:5} {req.url[:160]}")
             if VIDEO_RE.search(req.url):
-                add(req.url, req.headers.get("referer"), "url")
+                add(req.url, req.headers.get("referer"), "url", req)
 
         def on_response(resp):
             ctype = (resp.headers.get("content-type") or "").lower()
             if any(t in ctype for t in VIDEO_TYPES) or resp.request.resource_type == "media":
-                add(resp.url, resp.request.headers.get("referer"), f"type {ctype[:30]}")
+                add(resp.url, resp.request.headers.get("referer"), f"type {ctype[:30]}", resp.request)
 
         ctx.on("request", on_request)
         ctx.on("response", on_response)
@@ -201,6 +247,9 @@ async def find_video_url(video_id: str) -> dict:
                 f"<video> src: {vids or 'tidak ada'}\n\n"
                 f"Request terakhir ({len(seen)} total):\n" + "\n".join(seen[-40:])
             )
+        # Ambil header asli + isi respons dari browser untuk tiap kandidat (sebelum browser ditutup).
+        for c in cands:
+            await grab_from_browser(c, workdir)
         cookies = await ctx.cookies()
         await browser.close()
 
@@ -208,10 +257,17 @@ async def find_video_url(video_id: str) -> dict:
     rank = {"hls": 0, "mp4": 1, "webm": 2, "ts": 3}
     probes = []
     for c in cands:
-        kind, detail = await asyncio.to_thread(probe, c["url"], c["referer"], cookies)
+        c.pop("req", None)
+        browser_note = f"\n    browser: {c['browser']}" if c.get("browser") else ""
+        if c.get("body_file"):
+            probes.append(f"[{c['kind']}] ({c['how']}) {c['url'][:200]}{browser_note}\n    diambil dari browser")
+            continue
+        kind, detail = await asyncio.to_thread(probe, c, cookies)
         c["kind"] = kind
-        probes.append(f"[{kind}] ({c['how']}) {c['url'][:200]}\n    {detail}")
-    good = sorted((c for c in cands if c["kind"] in rank), key=lambda c: rank[c["kind"]])
+        probes.append(f"[{kind}] ({c['how']}) {c['url'][:200]}{browser_note}\n    unduh ulang: {detail}")
+    # utamakan yang isinya sudah ada di tangan
+    good = sorted((c for c in cands if c["kind"] in rank),
+                  key=lambda c: (0 if c.get("body_file") else 1, rank[c["kind"]]))
     if not good:
         report = "Kandidat yang diperiksa:\n" + ("\n".join(probes) or "  (tidak ada)") + "\n\n" + report
         raise NotFound(
@@ -231,29 +287,42 @@ def cookie_header(cookies: list, url: str) -> str:
     )
 
 
-def probe(url: str, referer: str, cookies: list) -> tuple[str, str]:
-    """Ambil 4 KB pertama dan tebak jenisnya: hls / mp4 / webm / ts / bukan video."""
-    headers = {"User-Agent": USER_AGENT, "Referer": referer, "Range": "bytes=0-4095"}
-    ck = cookie_header(cookies, url)
+def request_headers(info: dict, cookies: list) -> dict:
+    """Header untuk mengunduh ulang: pakai header asli browser kalau ada, plus cookie."""
+    headers = dict(info.get("headers") or {})
+    headers.setdefault("user-agent", USER_AGENT)
+    headers.setdefault("referer", info["referer"])
+    ck = cookie_header(cookies, info["url"])
     if ck:
-        headers["Cookie"] = ck
+        headers["cookie"] = ck
+    return headers
+
+
+def sniff(head: bytes) -> str:
+    if head.lstrip(b"\xef\xbb\xbf").startswith(b"#EXTM3U"):
+        return "hls"
+    if head[4:8] == b"ftyp":
+        return "mp4"
+    if head.startswith(b"\x1aE\xdf\xa3"):
+        return "webm"
+    if head[:1] == b"G" and len(head) > 188 and head[188:189] == b"G":
+        return "ts"
+    return "bukan-video"
+
+
+def probe(c: dict, cookies: list) -> tuple[str, str]:
+    """Ambil 4 KB pertama dan tebak jenisnya: hls / mp4 / webm / ts / bukan video."""
+    headers = request_headers(c, cookies)
+    headers["range"] = "bytes=0-4095"
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as r:
+        with urllib.request.urlopen(urllib.request.Request(c["url"], headers=headers), timeout=20) as r:
             head = r.read(4096)
             ctype = r.headers.get("content-type", "")
             code = r.status
     except Exception as e:
         return "error", str(e)[:200]
     detail = f"HTTP {code}, {ctype}, awal: {head[:80]!r}"
-    if head.lstrip(b"\xef\xbb\xbf").startswith(b"#EXTM3U"):
-        return "hls", detail
-    if head[4:8] == b"ftyp":
-        return "mp4", detail
-    if head.startswith(b"\x1aE\xdf\xa3"):
-        return "webm", detail
-    if head[:1] == b"G" and len(head) > 188 and head[188:189] == b"G":
-        return "ts", detail
-    return "bukan-video", detail
+    return sniff(head), detail
 
 
 def write_cookie_file(cookies: list, path: Path) -> None:
@@ -296,35 +365,41 @@ async def download_hls(info: dict, workdir: Path) -> Path:
 
 def http_download(info: dict, out: Path) -> None:
     """Unduh file video langsung (dipakai untuk link seperti stream.php yang tidak dikenali yt-dlp)."""
-    headers = {"User-Agent": USER_AGENT, "Referer": info["referer"]}
-    ck = cookie_header(info.get("cookies", []), info["url"])
-    if ck:
-        headers["Cookie"] = ck
+    headers = request_headers(info, info.get("cookies", []))
     req = urllib.request.Request(info["url"], headers=headers)
     with urllib.request.urlopen(req, timeout=60) as r, out.open("wb") as f:
         shutil.copyfileobj(r, f, 1024 * 1024)
     if out.stat().st_size == 0:
         raise RuntimeError("file kosong")
+    with out.open("rb") as f:
+        if sniff(f.read(4096)) == "bukan-video":
+            raise RuntimeError("server mengirim halaman, bukan video")
+
+
+async def to_mp4(src: Path, workdir: Path) -> Path:
+    if src.suffix.lower() == ".mp4":
+        return src
+    mp4 = workdir / f"{src.stem}_remux.mp4"
+    try:
+        await run("ffmpeg", "-y", "-v", "error", "-i", str(src), "-c", "copy",
+                  "-movflags", "+faststart", str(mp4))
+        return mp4
+    except Exception as e:
+        log.warning("remux ke mp4 gagal, kirim apa adanya: %s", e)
+        return src
 
 
 async def download(info: dict, workdir: Path) -> Path:
     kind = info.get("kind")
+    if info.get("body_file"):  # isi video sudah diterima browser
+        return await to_mp4(Path(info["body_file"]), workdir)
     if kind == "hls":
         return await download_hls(info, workdir)
     if kind in ("mp4", "webm", "ts"):
         direct = workdir / f"direct.{kind}"
         try:
             await asyncio.to_thread(http_download, info, direct)
-            if kind == "mp4":
-                return direct
-            mp4 = workdir / "direct_remux.mp4"
-            try:
-                await run("ffmpeg", "-y", "-v", "error", "-i", str(direct), "-c", "copy",
-                          "-movflags", "+faststart", str(mp4))
-                return mp4
-            except Exception as e:
-                log.warning("remux ke mp4 gagal, kirim apa adanya: %s", e)
-                return direct
+            return await to_mp4(direct, workdir)
         except Exception as e:
             log.warning("unduh langsung gagal, coba yt-dlp: %s", e)
             direct.unlink(missing_ok=True)
@@ -468,7 +543,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = None
     try:
         async with sem:
-            info = await find_video_url(m.group(1))
+            info = await find_video_url(m.group(1), workdir)
             await status.edit_text("⬇️ Mengunduh...")
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             path = await download(info, workdir)
