@@ -63,22 +63,48 @@ sem = asyncio.Semaphore(MAX_PARALLEL)
 
 
 # ---------------------------------------------------------------- cari link video
+class NotFound(RuntimeError):
+    """Gagal menemukan video; membawa data diagnosis (screenshot + teks)."""
+
+    def __init__(self, msg: str, screenshot: bytes | None = None, report: str = ""):
+        super().__init__(msg)
+        self.screenshot = screenshot
+        self.report = report
+
+
+VIDEO_TYPES = ("mpegurl", "video/", "dash+xml")
+SKIP_EXT = re.compile(r"\.(png|jpe?g|gif|webp|svg|css|woff2?|ttf|ico)(\?|$)", re.I)
+
+
 async def find_video_url(video_id: str) -> dict:
-    """Kembalikan {'url', 'referer', 'cookies'} atau raise RuntimeError."""
+    """Kembalikan {'url', 'referer', 'cookies'} atau raise NotFound."""
     page_url = f"https://vidmonstr.com/e/{video_id}"
     found: dict = {}
+    seen: list[str] = []  # log request untuk diagnosis
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
         ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720})
 
         def on_request(req):
+            if not SKIP_EXT.search(req.url):
+                seen.append(f"{req.resource_type[:5]:5} {req.url[:160]}")
             if not found and VIDEO_RE.search(req.url):
                 found["url"] = req.url
                 found["referer"] = req.headers.get("referer") or page_url
-                log.info("video ditemukan: %s", req.url)
+                log.info("video ditemukan (url): %s", req.url)
+
+        def on_response(resp):
+            if found:
+                return
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if any(t in ctype for t in VIDEO_TYPES):
+                found["url"] = resp.url
+                found["referer"] = resp.request.headers.get("referer") or page_url
+                log.info("video ditemukan (content-type %s): %s", ctype, resp.url)
 
         ctx.on("request", on_request)
+        ctx.on("response", on_response)
 
         page = await ctx.new_page()
 
@@ -93,34 +119,36 @@ async def find_video_url(video_id: str) -> dict:
         ctx.on("page", lambda np: asyncio.ensure_future(close_popup(np)))
 
         try:
-            await page.goto(page_url, wait_until="domcontentloaded", timeout=30_000)
+            resp = await page.goto(page_url, wait_until="domcontentloaded", timeout=30_000)
+            status = resp.status if resp else "?"
         except Exception as e:
             await browser.close()
-            raise RuntimeError(f"Gagal membuka halaman: {e}")
+            raise NotFound(f"Gagal membuka halaman: {e}")
 
         # Buang overlay iklan transparan lalu tampilkan iframe player (sama seperti klik thumbnail).
-        await page.evaluate(
-            """() => {
-                document.querySelectorAll('a[style*="position: fixed"], div[style*="opacity: 0.01"]')
-                    .forEach(el => el.remove());
-                const link = document.querySelector('.video-link');
-                if (link) link.click();
-                const f = document.getElementById('videq_iframe');
-                if (f) f.style.display = 'block';
-            }"""
-        )
+        try:
+            await page.evaluate(
+                """() => {
+                    document.querySelectorAll('a[style*="position: fixed"], div[style*="opacity: 0.01"]')
+                        .forEach(el => el.remove());
+                    const link = document.querySelector('.video-link');
+                    if (link) link.click();
+                    const f = document.getElementById('videq_iframe');
+                    if (f) f.style.display = 'block';
+                }"""
+            )
+        except Exception:
+            pass
 
         deadline = time.monotonic() + SNIFF_TIMEOUT
         while not found and time.monotonic() < deadline:
             for frame in page.frames:
                 try:
-                    # Coba tombol play umum
                     for sel in PLAY_SELECTORS:
                         el = await frame.query_selector(sel)
                         if el:
                             await el.click(timeout=1500, force=True)
                             break
-                    # Paksa <video> main (dibisukan agar autoplay diizinkan) + baca src langsung
                     src = await frame.evaluate(
                         """() => {
                             const v = document.querySelector('video');
@@ -138,11 +166,42 @@ async def find_video_url(video_id: str) -> dict:
             if not found:
                 await asyncio.sleep(2)
 
+        if "url" not in found:
+            # Kumpulkan data diagnosis sebelum browser ditutup.
+            shot = None
+            try:
+                shot = await page.screenshot(type="jpeg", quality=60)
+            except Exception:
+                pass
+            try:
+                title = await page.title()
+            except Exception:
+                title = "?"
+            frames = "\n".join(f"  {f.url[:160]}" for f in page.frames)
+            vids = []
+            for f in page.frames:
+                try:
+                    info = await f.evaluate(
+                        """() => [...document.querySelectorAll('video')].map(v =>
+                              (v.currentSrc || v.src || '(kosong)').slice(0,160))"""
+                    )
+                    vids += info
+                except Exception:
+                    pass
+            report = (
+                f"HTTP status: {status}\nJudul: {title}\n\nFrames:\n{frames}\n\n"
+                f"<video> src: {vids or 'tidak ada'}\n\n"
+                f"Request terakhir ({len(seen)} total):\n" + "\n".join(seen[-40:])
+            )
+            await browser.close()
+            raise NotFound(
+                "Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis).",
+                shot, report,
+            )
+
         found["cookies"] = await ctx.cookies()
         await browser.close()
 
-    if "url" not in found:
-        raise RuntimeError("Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis).")
     return found
 
 
@@ -316,6 +375,16 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     read_timeout=600, write_timeout=600,
                 )
         await status.delete()
+    except NotFound as e:
+        log.warning("tidak ketemu:\n%s", e.report)
+        await status.edit_text(f"❌ {e}")
+        if e.screenshot:
+            await update.message.reply_photo(e.screenshot, caption="Screenshot halaman yang dilihat bot")
+        if e.report:
+            rpt = Path(workdir) / "diagnosis.txt"
+            rpt.write_text(e.report)
+            with rpt.open("rb") as f:
+                await update.message.reply_document(f, filename="diagnosis.txt")
     except Exception as e:
         log.exception("gagal")
         await status.edit_text(f"❌ {e}")
