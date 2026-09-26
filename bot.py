@@ -132,13 +132,17 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
     def add(url: str, referer: str, how: str, req=None):
         if url.startswith(("blob:", "data:")):
             return
+        # Hanya bukti kuat (respons bertipe video, atau src <video>) yang membuat bot berhenti menunggu.
+        # Link yang cuma cocok pola URL (mis. stream.php) bisa saja halaman player, bukan videonya.
+        strong = how != "url"
+        if strong and not first_hit:
+            first_hit.append(time.monotonic())
         for c in cands:
             if c["url"] == url:
-                c.setdefault("req", req) if req else None
+                if req and not c.get("req"):
+                    c["req"] = req
                 return
         cands.append({"url": url, "referer": referer or page_url, "how": how, "req": req})
-        if not first_hit:
-            first_hit.append(time.monotonic())
         log.info("kandidat (%s): %s", how, url[:200])
 
     async with async_playwright() as p:
@@ -194,10 +198,25 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
             pass
 
         deadline = time.monotonic() + SNIFF_TIMEOUT
+        rounds = 0
         while time.monotonic() < deadline:
-            # setelah kandidat pertama, tunggu 6 detik lagi untuk mengumpulkan kandidat lain
+            # setelah bukti kuat pertama, tunggu 6 detik lagi untuk mengumpulkan kandidat lain
             if first_hit and time.monotonic() - first_hit[0] > 6:
                 break
+            rounds += 1
+            # Klik tengah player sekali-sekali, seperti user mengeklik video (tab iklan yang
+            # terbuka karena klik ini otomatis ditutup).
+            if rounds in (1, 3, 6):
+                for frame in page.frames:
+                    if frame == page.main_frame or "vidmonstr.com" not in frame.url:
+                        continue
+                    try:
+                        box = await (await frame.frame_element()).bounding_box()
+                        if box and box["width"] > 100:
+                            await page.mouse.click(box["x"] + box["width"] / 2,
+                                                   box["y"] + box["height"] / 2)
+                    except Exception:
+                        pass
             for frame in page.frames:
                 try:
                     for sel in PLAY_SELECTORS:
@@ -242,10 +261,23 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
                     vids += info
                 except Exception:
                     pass
+            # Isi HTML tiap frame milik vidmonstr (untuk melihat player apa yang dipakai).
+            doms = []
+            for f in page.frames:
+                if "vidmonstr.com" not in f.url and not f.url.startswith("blob:"):
+                    continue
+                try:
+                    html = await f.content()
+                    doms.append(f"--- {f.url[:120]}\n{html[:3000]}")
+                except Exception as e:
+                    doms.append(f"--- {f.url[:120]}\n(gagal dibaca: {e})")
+            own = [s for s in seen if "vidmonstr.com" in s or s.split(" ", 1)[0] in ("media", "other")]
             report = (
                 f"HTTP status: {status}\nJudul: {title}\n\nFrames:\n{frames}\n\n"
                 f"<video> src: {vids or 'tidak ada'}\n\n"
-                f"Request terakhir ({len(seen)} total):\n" + "\n".join(seen[-40:])
+                f"Request ke vidmonstr / media ({len(own)}):\n" + "\n".join(own[-40:]) + "\n\n"
+                f"Request terakhir ({len(seen)} total):\n" + "\n".join(seen[-40:]) + "\n\n"
+                "Isi frame:\n" + ("\n\n".join(doms) or "(tidak ada)")
             )
         # Ambil header asli + isi respons dari browser untuk tiap kandidat (sebelum browser ditutup).
         for c in cands:
@@ -316,13 +348,17 @@ def probe(c: dict, cookies: list) -> tuple[str, str]:
     headers["range"] = "bytes=0-4095"
     try:
         with urllib.request.urlopen(urllib.request.Request(c["url"], headers=headers), timeout=20) as r:
-            head = r.read(4096)
+            head = r.read(20000)
             ctype = r.headers.get("content-type", "")
             code = r.status
     except Exception as e:
         return "error", str(e)[:200]
+    kind = sniff(head[:4096])
     detail = f"HTTP {code}, {ctype}, awal: {head[:80]!r}"
-    return sniff(head), detail
+    if "html" in ctype.lower() and "vidmonstr.com" in c["url"]:
+        # halaman dari vidmonstr sendiri: simpan isinya, mungkin berisi link video aslinya
+        detail += "\n    ---- isi halaman ----\n" + head.decode("utf-8", "replace")[:6000] + "\n    ----"
+    return kind, detail
 
 
 def write_cookie_file(cookies: list, path: Path) -> None:
