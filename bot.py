@@ -164,10 +164,12 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
         ctx.on("response", on_response)
 
         page = await ctx.new_page()
+        keep: list = []  # halaman player yang sengaja dibuka bot (jangan ditutup)
 
         # Tab iklan yang dibuka otomatis langsung ditutup.
         async def close_popup(new_page):
-            if new_page != page:
+            await asyncio.sleep(0.5)
+            if new_page != page and new_page not in keep:
                 try:
                     await new_page.close()
                 except Exception:
@@ -182,21 +184,33 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
             await browser.close()
             raise NotFound(f"Gagal membuka halaman: {e}")
 
-        # Buang overlay iklan transparan lalu tampilkan iframe player (sama seperti klik thumbnail).
-        try:
-            await page.evaluate(
-                """() => {
-                    document.querySelectorAll('a[style*="position: fixed"], div[style*="opacity: 0.01"]')
-                        .forEach(el => el.remove());
-                    const link = document.querySelector('.video-link');
-                    if (link) link.click();
-                    const f = document.getElementById('videq_iframe');
-                    if (f) f.style.display = 'block';
-                }"""
-            )
-        except Exception:
-            pass
+        # Klik tombol play (thumbnail .video-link) di SEMUA frame lewat JavaScript, jadi tidak
+        # kena lapisan iklan transparan. Di vidmonstr tombol ini ada di dalam frame player.
+        CLICK_THUMB = """() => {
+            document.querySelectorAll('a[style*="position: fixed"], div[style*="opacity: 0.01"]')
+                .forEach(el => el.remove());
+            const link = document.querySelector('.video-link');
+            if (link) link.click();
+            const f = document.getElementById('videq_iframe');
+            if (f) f.style.display = 'block';
+            return !!link;
+        }"""
 
+        def all_frames():
+            for pg in [page, *keep]:
+                if not pg.is_closed():
+                    yield from pg.frames
+
+        def player_url() -> str | None:
+            if any("/stream.php?" in f.url for f in all_frames()):
+                return None  # player sudah terbuka sebagai frame
+            for c in cands:
+                if "/stream.php?" in c["url"]:
+                    return c["url"]
+            return None
+
+        player_referer = page_url
+        opened_player = False
         deadline = time.monotonic() + SNIFF_TIMEOUT
         rounds = 0
         while time.monotonic() < deadline:
@@ -204,20 +218,30 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
             if first_hit and time.monotonic() - first_hit[0] > 6:
                 break
             rounds += 1
-            # Klik tengah player sekali-sekali, seperti user mengeklik video (tab iklan yang
-            # terbuka karena klik ini otomatis ditutup).
-            if rounds in (1, 3, 6):
-                for frame in page.frames:
-                    if frame == page.main_frame or "vidmonstr.com" not in frame.url:
+            if rounds <= 3:
+                for frame in list(all_frames()):
+                    if "vidmonstr.com" not in frame.url:
                         continue
                     try:
-                        box = await (await frame.frame_element()).bounding_box()
-                        if box and box["width"] > 100:
-                            await page.mouse.click(box["x"] + box["width"] / 2,
-                                                   box["y"] + box["height"] / 2)
+                        if await frame.evaluate(CLICK_THUMB) and frame != page.main_frame:
+                            player_referer = frame.url
                     except Exception:
                         pass
-            for frame in page.frames:
+            # Kalau player belum muncul juga, buka halaman player stream.php langsung
+            # (itu yang dilakukan tombol play), dengan referer frame player.
+            if rounds == 4 and not first_hit and not opened_player:
+                url = player_url()
+                if url:
+                    opened_player = True
+                    try:
+                        pg = await ctx.new_page()
+                        keep.append(pg)
+                        await pg.goto(url, referer=player_referer, wait_until="domcontentloaded",
+                                      timeout=30_000)
+                        log.info("membuka player langsung: %s", url[:120])
+                    except Exception as e:
+                        log.warning("gagal membuka player: %s", e)
+            for frame in list(all_frames()):
                 try:
                     for sel in PLAY_SELECTORS:
                         el = await frame.query_selector(sel)
@@ -243,16 +267,17 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
         if True:
             shot = None
             try:
-                shot = await page.screenshot(type="jpeg", quality=60)
+                shot_page = keep[-1] if keep and not keep[-1].is_closed() else page
+                shot = await shot_page.screenshot(type="jpeg", quality=60)
             except Exception:
                 pass
             try:
                 title = await page.title()
             except Exception:
                 title = "?"
-            frames = "\n".join(f"  {f.url[:160]}" for f in page.frames)
+            frames = "\n".join(f"  {f.url[:160]}" for f in all_frames())
             vids = []
-            for f in page.frames:
+            for f in all_frames():
                 try:
                     info = await f.evaluate(
                         """() => [...document.querySelectorAll('video')].map(v =>
@@ -263,12 +288,12 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
                     pass
             # Isi HTML tiap frame milik vidmonstr (untuk melihat player apa yang dipakai).
             doms = []
-            for f in page.frames:
+            for f in all_frames():
                 if "vidmonstr.com" not in f.url and not f.url.startswith("blob:"):
                     continue
                 try:
-                    html = await f.content()
-                    doms.append(f"--- {f.url[:120]}\n{html[:3000]}")
+                    body = await f.evaluate("() => document.body ? document.body.innerHTML : ''")
+                    doms.append(f"--- {f.url[:120]}\n{body[:4000]}")
                 except Exception as e:
                     doms.append(f"--- {f.url[:120]}\n(gagal dibaca: {e})")
             own = [s for s in seen if "vidmonstr.com" in s or s.split(" ", 1)[0] in ("media", "other")]
