@@ -774,9 +774,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             meta = await video_meta(part)
             thumb = cover_thumb if (i == 1 and cover_thumb) else await make_thumb(part, workdir / f"thumb{i}.jpg")
-            cap = [f"Bagian {i}/{total}"] if total > 1 else []
-            if VIDEO_INFO and i == 1:
-                cap += [f"asli: {info_asli}", f"kirim: {await tech_info(part)}"]
+            cap = ["ini milik @aiviral2"]
             kwargs = dict(
                 caption="\n".join(cap) or None,
                 supports_streaming=True,
