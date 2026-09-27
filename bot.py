@@ -47,6 +47,8 @@ MAX_PARTS = int(os.environ.get("MAX_PARTS", "20"))  # batas jumlah potongan per 
 MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "1"))
 SNIFF_TIMEOUT = int(os.environ.get("SNIFF_TIMEOUT", "40"))  # detik menunggu link video
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
+# Tampilkan info teknis video (ukuran, rasio piksel, rotasi) di caption. Set VIDEO_INFO=0 untuk mematikan.
+VIDEO_INFO = os.environ.get("VIDEO_INFO", "1") != "0"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -534,6 +536,25 @@ async def video_meta(path: Path) -> dict:
         return {}
 
 
+async def tech_info(path: Path) -> str:
+    """Ringkasan teknis satu baris, untuk melacak masalah tampilan (gepeng, terbalik, dll.)."""
+    try:
+        out = await run(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,width,height,sample_aspect_ratio,display_aspect_ratio"
+            ":stream_tags=rotate:stream_side_data=rotation", "-of", "json", str(path),
+        )
+        st = (json.loads(out).get("streams") or [{}])[0]
+        rot = st.get("tags", {}).get("rotate") or next(
+            (sd["rotation"] for sd in st.get("side_data_list", []) or [] if "rotation" in sd), 0)
+        mb = path.stat().st_size / 1024 / 1024
+        return (f"📐 {st.get('width')}×{st.get('height')} · SAR {st.get('sample_aspect_ratio', '?')} · "
+                f"DAR {st.get('display_aspect_ratio', '?')} · rotasi {rot} · "
+                f"{st.get('codec_name', '?')} · {mb:.1f} MB")
+    except Exception as e:
+        return f"📐 info gagal: {e}"
+
+
 async def make_thumb(path: Path, out: Path) -> Path | None:
     """Thumbnail kecil (maks 320 px) agar pratinjau di Telegram tidak gepeng."""
     try:
@@ -676,6 +697,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             path = await download(info, workdir)
 
+        info_asli = await tech_info(path) if VIDEO_INFO else ""
         path = await fix_aspect(path, workdir, status)
         parts = await fit_for_upload(path, workdir, status)
 
@@ -687,9 +709,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with part.open("rb") as f:
                 meta = await video_meta(part)
                 thumb = await make_thumb(part, workdir / f"thumb{i}.jpg")
+                cap = [f"Bagian {i}/{total}"] if total > 1 else []
+                if VIDEO_INFO and i == 1:
+                    cap += [f"asli: {info_asli}", f"kirim: {await tech_info(part)}"]
                 await update.message.reply_video(
                     f,
-                    caption=f"Bagian {i}/{total}" if total > 1 else None,
+                    caption="\n".join(cap) or None,
                     supports_streaming=True,
                     width=meta.get("width"), height=meta.get("height"),
                     duration=meta.get("duration"),
