@@ -12,6 +12,7 @@ Tidak ada bypass captcha / penyamaran fingerprint. Kalau situs menolak, bot mela
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -509,6 +510,42 @@ async def run(*cmd: str) -> str:
     return out.decode(errors="ignore")
 
 
+async def video_meta(path: Path) -> dict:
+    """Lebar, tinggi (sudah memperhitungkan rotasi video HP) dan durasi, untuk dikirim ke Telegram."""
+    try:
+        out = await run(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation"
+            ":format=duration", "-of", "json", str(path),
+        )
+        data = json.loads(out)
+        st = (data.get("streams") or [{}])[0]
+        w, h = int(st.get("width") or 0), int(st.get("height") or 0)
+        rot = st.get("tags", {}).get("rotate")
+        for sd in st.get("side_data_list", []) or []:
+            if "rotation" in sd:
+                rot = sd["rotation"]
+        if rot is not None and abs(int(float(rot))) % 180 == 90:
+            w, h = h, w
+        dur = float(data.get("format", {}).get("duration") or 0)
+        return {"width": w or None, "height": h or None, "duration": int(round(dur)) or None}
+    except Exception as e:
+        log.warning("gagal membaca ukuran video: %s", e)
+        return {}
+
+
+async def make_thumb(path: Path, out: Path) -> Path | None:
+    """Thumbnail kecil (maks 320 px) agar pratinjau di Telegram tidak gepeng."""
+    try:
+        await run(
+            "ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", str(path), "-frames:v", "1",
+            "-vf", "scale='if(gte(iw,ih),320,-2)':'if(gte(iw,ih),-2,320)'", "-q:v", "5", str(out),
+        )
+        return out if out.exists() and out.stat().st_size > 0 else None
+    except Exception:
+        return None
+
+
 async def duration_of(path: Path) -> float:
     out = await run(
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -530,7 +567,7 @@ async def compress(path: Path, workdir: Path) -> Path:
         "ffmpeg", "-y", "-v", "error", "-i", str(path),
         "-c:v", "libx264", "-preset", "veryfast",
         "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
-        "-vf", "scale='min(1280,iw)':-2",
+        "-vf", "scale='if(gte(iw,ih),min(1280,iw),-2)':'if(gte(iw,ih),-2,min(1280,ih))'",
         "-c:a", "aac", "-b:a", f"{audio_kbps}k",
         "-movflags", "+faststart", str(out),
     )
@@ -617,10 +654,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text(label)
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             with part.open("rb") as f:
+                meta = await video_meta(part)
+                thumb = await make_thumb(part, workdir / f"thumb{i}.jpg")
                 await update.message.reply_video(
                     f,
                     caption=f"Bagian {i}/{total}" if total > 1 else None,
                     supports_streaming=True,
+                    width=meta.get("width"), height=meta.get("height"),
+                    duration=meta.get("duration"),
+                    thumbnail=thumb.open("rb") if thumb else None,
                     read_timeout=600, write_timeout=600,
                 )
         await status.delete()
