@@ -24,12 +24,15 @@ dan kamu bisa lihat apa yang terjadi, lalu kirim pesan error/log-nya.
 |---|---|---|
 | `BOT_TOKEN` | ya | Token dari @BotFather |
 | `ALLOWED_USER_IDS` | tidak | ID Telegram yang boleh pakai, pisah koma. Kosong = semua orang |
+| `API_ID` | tidak | Dari https://my.telegram.org. Bersama `API_HASH`, video dikirim utuh sampai 2000 MB (lihat bawah) |
+| `API_HASH` | tidak | Dari https://my.telegram.org |
 | `BOT_API_URL` | tidak | Alamat Local Bot API Server (mis. `http://localhost:8081`). Kalau diisi, batas upload jadi 2000 MB |
-| `MAX_UPLOAD_MB` | tidak | Default 50 (atau 2000 kalau `BOT_API_URL` diisi) |
-| `COMPRESS_RATIO` | tidak | Video sampai batas × rasio ini dikompres, di atasnya dipotong. Default 1.5 |
+| `MAX_UPLOAD_MB` | tidak | Default 50 (atau 2000 kalau `API_ID`/`API_HASH` atau `BOT_API_URL` diisi) |
+| `COMPRESS_RATIO` | tidak | Video sampai batas × rasio ini dikompres, di atasnya dipotong. Default 1.5 (1.0 = tanpa kompres di mode MTProto) |
 | `MAX_PARTS` | tidak | Maksimal jumlah potongan per video, default 20 |
 | `MAX_PARALLEL` | tidak | Jumlah unduhan bersamaan, default 1 |
 | `SNIFF_TIMEOUT` | tidak | Detik menunggu link video, default 40 |
+| `BODY_MAX_MB` | tidak | Respons video dari browser di atas ukuran ini tidak dibaca ke RAM, tapi diunduh ulang ke disk. Default 100 |
 | `HEADLESS` | tidak | `0` = tampilkan browser (untuk debug) |
 
 ## Deploy ke Heroku
@@ -49,6 +52,18 @@ Butuh RAM minimal ~512 MB; dyno Eco/Basic bisa pas-pasan saat Chromium jalan.
 
 ## Video besar
 
+### Kirim utuh sampai 2 GB lewat MTProto (disarankan, jalan di Heroku)
+
+1. Login di https://my.telegram.org → **API development tools** → buat aplikasi, catat `api_id` dan `api_hash`.
+2. Di Heroku → Settings → Config Vars, tambahkan `API_ID` dan `API_HASH`.
+3. Deploy ulang. Di log harus muncul `MTProto aktif sebagai @namabot`.
+
+Bot tetap memakai token yang sama; hanya pengiriman video yang lewat MTProto (Telethon), sehingga video
+sampai 2000 MB dikirim sebagai satu file. Video di atas 2 GB tetap dipotong (batas Telegram).
+Progres upload tampil dalam persen di pesan status.
+
+### Tanpa `API_ID` / `API_HASH` (batas 50 MB)
+
 - **≤ 50 MB**: dikirim langsung.
 - **50–75 MB**: dikompres (maks 720p) supaya jadi satu file di bawah 50 MB. Kalau gagal, dipotong.
 - **> 75 MB**: dipotong jadi beberapa bagian < 50 MB tanpa encode ulang, dikirim berurutan "Bagian 1/3", dst.
@@ -67,5 +82,6 @@ Butuh RAM minimal ~512 MB; dyno Eco/Basic bisa pas-pasan saat Chromium jalan.
 
 ## Batasan
 
-- Tanpa Local Bot API Server, file dikirim maks 50 MB per bagian.
+- Tanpa `API_ID`/`API_HASH` atau Local Bot API Server, file dikirim maks 50 MB per bagian.
+- Video besar butuh ruang disk sementara kira-kira 2–3× ukurannya (unduhan + perbaikan rasio).
 - Kalau vidmonstr mengubah player atau mewajibkan captcha, bot akan gagal — tidak ada bypass captcha.

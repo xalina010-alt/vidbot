@@ -40,9 +40,15 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()}
 # Opsional: alamat Local Bot API Server, contoh "http://localhost:8081". Kalau diisi, batas upload 2000 MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").rstrip("/")
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if BOT_API_URL else "50"))
+# Opsional: api_id & api_hash dari https://my.telegram.org. Kalau diisi, video dikirim lewat MTProto
+# (Telethon) dengan token bot yang sama, jadi batas upload naik dari 50 MB ke 2000 MB tanpa server tambahan.
+API_ID = int(os.environ.get("API_ID") or 0)
+API_HASH = os.environ.get("API_HASH", "").strip()
+MTPROTO = bool(API_ID and API_HASH) and not BOT_API_URL
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if (BOT_API_URL or MTPROTO) else "50"))
 # Video yang lebih besar dari batas tapi <= batas x rasio ini dikompres dulu; selebihnya dipotong.
-COMPRESS_RATIO = float(os.environ.get("COMPRESS_RATIO", "1.5"))
+# Mode MTProto: default 1.0 (tanpa kompres) karena meng-encode video > 2 GB di Heroku terlalu berat.
+COMPRESS_RATIO = float(os.environ.get("COMPRESS_RATIO", "1.0" if MTPROTO else "1.5"))
 MAX_PARTS = int(os.environ.get("MAX_PARTS", "20"))  # batas jumlah potongan per video
 MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "1"))
 SNIFF_TIMEOUT = int(os.environ.get("SNIFF_TIMEOUT", "40"))  # detik menunggu link video
@@ -86,6 +92,9 @@ SKIP_EXT = re.compile(r"\.(png|jpe?g|gif|webp|svg|css|woff2?|ttf|ico)(\?|$)", re
 # Header yang tidak boleh ikut disalin saat meniru request browser.
 DROP_HEADERS = {"host", "content-length", "range", "accept-encoding", "connection"}
 BODY_TIMEOUT = int(os.environ.get("BODY_TIMEOUT", "300"))  # detik menunggu browser selesai memuat video
+# Isi respons browser dibaca utuh ke RAM. Di atas batas ini jangan diambil dari browser (dyno Heroku 512 MB
+# bisa crash); video diunduh ulang langsung ke disk.
+BODY_MAX_MB = int(os.environ.get("BODY_MAX_MB", "100"))
 
 
 async def grab_from_browser(c: dict, workdir: Path) -> None:
@@ -111,6 +120,13 @@ async def grab_from_browser(c: dict, workdir: Path) -> None:
             return
         ctype = resp.headers.get("content-type", "")
         c["browser"] = f"HTTP {resp.status}, {ctype}"
+        try:
+            clen = int(resp.headers.get("content-length") or 0)
+        except ValueError:
+            clen = 0
+        if clen > BODY_MAX_MB * 1024 * 1024:
+            c["browser"] += f", {clen / 1024 / 1024:.0f} MB, terlalu besar untuk RAM, diunduh ulang"
+            return
         body = await asyncio.wait_for(resp.body(), BODY_TIMEOUT)
         kind = sniff(body[:4096])
         c["browser"] += f", {len(body) / 1024 / 1024:.1f} MB, isi: {kind}"
@@ -730,6 +746,72 @@ async def fit_for_upload(path: Path, workdir: Path, status) -> list[Path]:
     return await split(path, workdir)
 
 
+# ---------------------------------------------------------------- kirim lewat MTProto (sampai 2 GB)
+tg = None  # klien Telethon, diisi di post_init kalau API_ID & API_HASH ada
+
+
+async def start_mtproto(_app) -> None:
+    global tg
+    if not MTPROTO:
+        return
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    # Sesi di memori: login ulang tiap dyno restart, tidak perlu file sesi.
+    # Update tetap diterima agar Telethon mengenal user/grup yang mengirim link.
+    tg = TelegramClient(StringSession(), API_ID, API_HASH)
+    await tg.start(bot_token=BOT_TOKEN)
+    me = await tg.get_me()
+    log.info("MTProto aktif sebagai @%s (upload sampai %d MB)", me.username, MAX_UPLOAD_MB)
+
+
+async def stop_mtproto(_app) -> None:
+    if tg:
+        await tg.disconnect()
+
+
+async def send_mtproto(update: Update, part: Path, caption: str | None, thumb: Path | None,
+                       meta: dict, status, label: str) -> None:
+    from telethon.tl.types import DocumentAttributeVideo
+
+    chat_id = update.effective_chat.id
+    entity = None
+    for _ in range(5):  # beri waktu Telethon mencatat user dari update terbaru
+        try:
+            entity = await tg.get_input_entity(chat_id)
+            break
+        except ValueError:
+            await asyncio.sleep(1)
+    if entity is None:
+        raise RuntimeError("MTProto tidak mengenali chat ini. Kirim link sekali lagi.")
+
+    last = [0.0]
+
+    async def progress(done: int, total: int):
+        now = time.monotonic()
+        if now - last[0] < 5 or not total:
+            return
+        last[0] = now
+        try:
+            await status.edit_text(f"{label} {done * 100 // total}%")
+        except Exception:
+            pass
+
+    await tg.send_file(
+        entity, str(part),
+        caption=caption,
+        thumb=str(thumb) if thumb else None,
+        supports_streaming=True,
+        attributes=[DocumentAttributeVideo(
+            duration=meta.get("duration") or 0,
+            w=meta.get("width") or 0, h=meta.get("height") or 0,
+            supports_streaming=True,
+        )],
+        reply_to=update.message.message_id,
+        progress_callback=progress,
+    )
+
+
 # ---------------------------------------------------------------- handler telegram
 def allowed(update: Update) -> bool:
     return not ALLOWED or (update.effective_user and update.effective_user.id in ALLOWED)
@@ -775,6 +857,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             meta = await video_meta(part)
             thumb = cover_thumb if (i == 1 and cover_thumb) else await make_thumb(part, workdir / f"thumb{i}.jpg")
             cap = ["ini milik @aiviral2"]
+            if tg:
+                await send_mtproto(update, part, "\n".join(cap) or None, thumb, meta, status, label)
+                continue
             kwargs = dict(
                 caption="\n".join(cap) or None,
                 supports_streaming=True,
@@ -816,7 +901,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    builder = Application.builder().token(BOT_TOKEN)
+    builder = Application.builder().token(BOT_TOKEN).post_init(start_mtproto).post_shutdown(stop_mtproto)
     if BOT_API_URL:
         builder = (
             builder.base_url(f"{BOT_API_URL}/bot")
@@ -826,7 +911,8 @@ def main():
     app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    log.info("bot jalan (batas upload %d MB%s)", MAX_UPLOAD_MB, ", local API" if BOT_API_URL else "")
+    log.info("bot jalan (batas upload %d MB%s)", MAX_UPLOAD_MB,
+             ", local API" if BOT_API_URL else ", MTProto" if MTPROTO else "")
     app.run_polling()
 
 
