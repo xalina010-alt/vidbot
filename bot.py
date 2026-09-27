@@ -600,6 +600,36 @@ async def split(path: Path, workdir: Path) -> list[Path]:
     raise RuntimeError("Gagal memotong video jadi ukuran yang muat.")
 
 
+async def fix_aspect(path: Path, workdir: Path, status) -> Path:
+    """Video dengan piksel tidak persegi (SAR != 1:1) tampil benar di browser, tapi aplikasi
+    Telegram mengabaikan SAR sehingga gambarnya gepeng. Ubah jadi piksel persegi."""
+    try:
+        out = await run(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=sample_aspect_ratio", "-of", "default=nw=1:nk=1", str(path),
+        )
+        sar = out.strip().splitlines()[0] if out.strip() else "1:1"
+        num, den = (int(x) for x in sar.split(":"))
+    except Exception:
+        return path
+    if num <= 0 or den <= 0 or num == den:
+        return path
+    log.info("SAR %s, diperbaiki ke 1:1", sar)
+    await status.edit_text("🛠️ Memperbaiki rasio gambar...")
+    fixed = workdir / "aspect.mp4"
+    try:
+        await run(
+            "ffmpeg", "-y", "-v", "error", "-i", str(path),
+            "-vf", "scale='trunc(iw*sar/2)*2':'trunc(ih/2)*2',setsar=1",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "copy", "-movflags", "+faststart", str(fixed),
+        )
+        return fixed
+    except Exception as e:
+        log.warning("gagal memperbaiki rasio: %s", e)
+        return path
+
+
 async def fit_for_upload(path: Path, workdir: Path, status) -> list[Path]:
     size = path.stat().st_size
     if size <= LIMIT_BYTES:
@@ -646,6 +676,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             path = await download(info, workdir)
 
+        path = await fix_aspect(path, workdir, status)
         parts = await fit_for_upload(path, workdir, status)
 
         total = len(parts)
