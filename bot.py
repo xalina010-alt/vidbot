@@ -512,25 +512,40 @@ async def run(*cmd: str) -> str:
     return out.decode(errors="ignore")
 
 
+async def probe_video(path: Path) -> dict:
+    """Info stream video pertama + format, via ffprobe -show_streams (jalan di ffmpeg 4.x maupun baru)."""
+    out = await run(
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_streams", "-show_format", "-of", "json", str(path),
+    )
+    data = json.loads(out)
+    st = (data.get("streams") or [{}])[0]
+    rot = st.get("tags", {}).get("rotate")
+    for sd in st.get("side_data_list", []) or []:
+        if "rotation" in sd:
+            rot = sd["rotation"]
+    st["_rotation"] = int(float(rot)) if rot not in (None, "") else 0
+    st["_duration"] = float(data.get("format", {}).get("duration") or st.get("duration") or 0)
+    return st
+
+
 async def video_meta(path: Path) -> dict:
-    """Lebar, tinggi (sudah memperhitungkan rotasi video HP) dan durasi, untuk dikirim ke Telegram."""
+    """Lebar & tinggi TAMPILAN (memperhitungkan rotasi dan rasio piksel) serta durasi, untuk Telegram.
+    Tanpa ini, aplikasi Telegram di HP menebak ukuran sendiri dan videonya bisa tampil gepeng."""
     try:
-        out = await run(
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation"
-            ":format=duration", "-of", "json", str(path),
-        )
-        data = json.loads(out)
-        st = (data.get("streams") or [{}])[0]
+        st = await probe_video(path)
         w, h = int(st.get("width") or 0), int(st.get("height") or 0)
-        rot = st.get("tags", {}).get("rotate")
-        for sd in st.get("side_data_list", []) or []:
-            if "rotation" in sd:
-                rot = sd["rotation"]
-        if rot is not None and abs(int(float(rot))) % 180 == 90:
+        sar = st.get("sample_aspect_ratio") or "1:1"
+        try:
+            n, d = (int(x) for x in sar.split(":"))
+            if n > 0 and d > 0 and n != d:
+                w = int(round(w * n / d))
+        except ValueError:
+            pass
+        if abs(st["_rotation"]) % 180 == 90:
             w, h = h, w
-        dur = float(data.get("format", {}).get("duration") or 0)
-        return {"width": w or None, "height": h or None, "duration": int(round(dur)) or None}
+        dur = int(round(st["_duration"]))
+        return {"width": w or None, "height": h or None, "duration": dur or None}
     except Exception as e:
         log.warning("gagal membaca ukuran video: %s", e)
         return {}
@@ -539,20 +554,13 @@ async def video_meta(path: Path) -> dict:
 async def tech_info(path: Path) -> str:
     """Ringkasan teknis satu baris, untuk melacak masalah tampilan (gepeng, terbalik, dll.)."""
     try:
-        out = await run(
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name,width,height,sample_aspect_ratio,display_aspect_ratio"
-            ":stream_tags=rotate:stream_side_data=rotation", "-of", "json", str(path),
-        )
-        st = (json.loads(out).get("streams") or [{}])[0]
-        rot = st.get("tags", {}).get("rotate") or next(
-            (sd["rotation"] for sd in st.get("side_data_list", []) or [] if "rotation" in sd), 0)
+        st = await probe_video(path)
         mb = path.stat().st_size / 1024 / 1024
         return (f"📐 {st.get('width')}×{st.get('height')} · SAR {st.get('sample_aspect_ratio', '?')} · "
-                f"DAR {st.get('display_aspect_ratio', '?')} · rotasi {rot} · "
+                f"DAR {st.get('display_aspect_ratio', '?')} · rotasi {st['_rotation']} · "
                 f"{st.get('codec_name', '?')} · {mb:.1f} MB")
     except Exception as e:
-        return f"📐 info gagal: {e}"
+        return f"📐 info gagal: {str(e)[:200]}"
 
 
 async def make_thumb(path: Path, out: Path) -> Path | None:
