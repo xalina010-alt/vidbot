@@ -125,6 +125,43 @@ async def grab_from_browser(c: dict, workdir: Path) -> None:
         c["browser"] = c.get("browser", "") + f", isi tidak bisa diambil: {str(e)[:150]}"
 
 
+GET_COVER_JS = """() => {
+    const v = document.querySelector('video[poster]');
+    if (v && v.poster) return v.poster;
+    const i = document.querySelector('.video-link img, img.thumbnail, .plyr__poster, .thumbnail');
+    if (i) {
+        if (i.currentSrc || i.src) return i.currentSrc || i.src;
+        const m = (getComputedStyle(i).backgroundImage || '').match(/url\\(["']?(.*?)["']?\\)/);
+        if (m) return m[1];
+    }
+    const og = document.querySelector('meta[property="og:image"]');
+    return og ? og.content : null;
+}"""
+
+
+async def grab_cover(ctx, frames, workdir: Path) -> Path | None:
+    """Unduh gambar cover/thumbnail yang tampil di halaman video (pakai cookie browser)."""
+    for f in frames:
+        try:
+            url = await f.evaluate(GET_COVER_JS)
+        except Exception:
+            continue
+        if not url or not url.startswith("http"):
+            continue
+        try:
+            r = await ctx.request.get(url, headers={"referer": f.url}, timeout=15_000)
+            body = await r.body() if r.ok else b""
+        except Exception as e:
+            log.info("gagal mengunduh cover %s: %s", url[:120], e)
+            continue
+        if len(body) > 500:
+            out = workdir / "cover_src"
+            out.write_bytes(body)
+            log.info("cover: %s (%d KB)", url[:120], len(body) // 1024)
+            return out
+    return None
+
+
 async def find_video_url(video_id: str, workdir: Path) -> dict:
     """Kembalikan {'url', 'referer', 'kind', 'cookies'} atau raise NotFound."""
     page_url = f"https://vidmonstr.com/e/{video_id}"
@@ -310,6 +347,7 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
         # Ambil header asli + isi respons dari browser untuk tiap kandidat (sebelum browser ditutup).
         for c in cands:
             await grab_from_browser(c, workdir)
+        cover_file = await grab_cover(ctx, list(all_frames()), workdir)
         cookies = await ctx.cookies()
         await browser.close()
 
@@ -336,7 +374,8 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
         )
     best = good[0]
     log.info("dipilih [%s]: %s", best["kind"], best["url"][:200])
-    return {**best, "cookies": cookies, "report": "\n".join(probes)}
+    return {**best, "cookies": cookies, "report": "\n".join(probes),
+            "cover_file": str(cover_file) if cover_file else None}
 
 
 def cookie_header(cookies: list, url: str) -> str:
@@ -563,6 +602,21 @@ async def tech_info(path: Path) -> str:
         return f"📐 info gagal: {str(e)[:200]}"
 
 
+async def make_cover(src: Path, workdir: Path) -> tuple[Path | None, Path | None]:
+    """Dari gambar cover situs: cover JPEG (sisi terpanjang maks 1280) + thumbnail kecil (maks 320)."""
+    cover, thumb = workdir / "cover.jpg", workdir / "cover_thumb.jpg"
+    try:
+        await run("ffmpeg", "-y", "-v", "error", "-i", str(src), "-frames:v", "1",
+                  "-vf", "scale='if(gte(iw,ih),min(1280,iw),-2)':'if(gte(iw,ih),-2,min(1280,ih))'",
+                  "-q:v", "3", str(cover))
+        await run("ffmpeg", "-y", "-v", "error", "-i", str(src), "-frames:v", "1",
+                  "-vf", "scale='if(gte(iw,ih),320,-2)':'if(gte(iw,ih),-2,320)'", "-q:v", "5", str(thumb))
+    except Exception as e:
+        log.warning("gagal membuat cover: %s", e)
+        return None, None
+    return (cover if cover.exists() else None), (thumb if thumb.exists() else None)
+
+
 async def make_thumb(path: Path, out: Path) -> Path | None:
     """Thumbnail kecil (maks 320 px) agar pratinjau di Telegram tidak gepeng."""
     try:
@@ -709,26 +763,36 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = await fix_aspect(path, workdir, status)
         parts = await fit_for_upload(path, workdir, status)
 
+        cover_img = cover_thumb = None
+        if (info or {}).get("cover_file"):
+            cover_img, cover_thumb = await make_cover(Path(info["cover_file"]), workdir)
+
         total = len(parts)
         for i, part in enumerate(parts, 1):
             label = f"⬆️ Mengirim bagian {i}/{total}..." if total > 1 else "⬆️ Mengirim..."
             await status.edit_text(label)
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
-            with part.open("rb") as f:
-                meta = await video_meta(part)
-                thumb = await make_thumb(part, workdir / f"thumb{i}.jpg")
-                cap = [f"Bagian {i}/{total}"] if total > 1 else []
-                if VIDEO_INFO and i == 1:
-                    cap += [f"asli: {info_asli}", f"kirim: {await tech_info(part)}"]
-                await update.message.reply_video(
-                    f,
-                    caption="\n".join(cap) or None,
-                    supports_streaming=True,
-                    width=meta.get("width"), height=meta.get("height"),
-                    duration=meta.get("duration"),
-                    thumbnail=thumb.open("rb") if thumb else None,
-                    read_timeout=600, write_timeout=600,
-                )
+            meta = await video_meta(part)
+            thumb = cover_thumb if (i == 1 and cover_thumb) else await make_thumb(part, workdir / f"thumb{i}.jpg")
+            cap = [f"Bagian {i}/{total}"] if total > 1 else []
+            if VIDEO_INFO and i == 1:
+                cap += [f"asli: {info_asli}", f"kirim: {await tech_info(part)}"]
+            kwargs = dict(
+                caption="\n".join(cap) or None,
+                supports_streaming=True,
+                width=meta.get("width"), height=meta.get("height"),
+                duration=meta.get("duration"),
+                thumbnail=thumb,
+                read_timeout=600, write_timeout=600,
+            )
+            if cover_img and i == 1:
+                kwargs["cover"] = cover_img  # tampilan awal video (Bot API 8.3+)
+            try:
+                await update.message.reply_video(part, **kwargs)
+            except TypeError:
+                # versi python-telegram-bot lama belum kenal 'cover'
+                kwargs.pop("cover", None)
+                await update.message.reply_video(part, **kwargs)
         await status.delete()
     except NotFound as e:
         log.warning("tidak ketemu:\n%s", e.report)
