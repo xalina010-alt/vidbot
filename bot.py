@@ -1,5 +1,5 @@
 """
-Bot Telegram: kirim link vidmonstr.com/e/... atau /d/... -> bot membalas file videonya.
+Bot Telegram: kirim link vidmonstr.com / fiuosba.com (/e/... atau /d/...) -> bot membalas file videonya.
 
 Cara kerja:
 1. Buka halaman embed pakai browser otomatis (Playwright/Chromium).
@@ -61,7 +61,14 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
-LINK_RE = re.compile(r"https?://(?:www\.)?vidmonstr\.com/(?:e|d)/([A-Za-z0-9]+)")
+# Situs yang dikenali (satu player yang sama, beda domain). Tambah domain lain lewat Config Var
+# SITES di Heroku, pisahkan dengan koma, mis. "vidmonstr.com,fiuosba.com,situslain.com".
+SITES = [d.strip().lower().removeprefix("www.") for d in
+         os.environ.get("SITES", "vidmonstr.com,fiuosba.com").split(",") if d.strip()]
+LINK_RE = re.compile(
+    r"https?://(?:www\.)?(" + "|".join(re.escape(d) for d in SITES) + r")/(?:e|d)/([A-Za-z0-9]+)",
+    re.I,
+)
 # .m3u8/.mp4 biasa, plus stream.php milik vidmonstr (player-nya mengambil video dari sini lalu
 # memutarnya lewat blob:, jadi link ini tidak berakhiran .mp4 dan tidak terlihat di <video>).
 VIDEO_RE = re.compile(r"\.(m3u8|mp4)(\?|$)|/stream\.php\?", re.I)
@@ -179,9 +186,9 @@ async def grab_cover(ctx, frames, workdir: Path) -> Path | None:
     return None
 
 
-async def find_video_url(video_id: str, workdir: Path) -> dict:
+async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.com") -> dict:
     """Kembalikan {'url', 'referer', 'kind', 'cookies'} atau raise NotFound."""
-    page_url = f"https://vidmonstr.com/e/{video_id}"
+    page_url = f"https://{host}/e/{video_id}"
     cands: list[dict] = []  # semua link yang mungkin video
     seen: list[str] = []  # log request untuk diagnosis
     first_hit: list[float] = []
@@ -277,7 +284,7 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
             rounds += 1
             if rounds <= 3:
                 for frame in list(all_frames()):
-                    if "vidmonstr.com" not in frame.url:
+                    if host not in frame.url:
                         continue
                     try:
                         if await frame.evaluate(CLICK_THUMB) and frame != page.main_frame:
@@ -346,18 +353,18 @@ async def find_video_url(video_id: str, workdir: Path) -> dict:
             # Isi HTML tiap frame milik vidmonstr (untuk melihat player apa yang dipakai).
             doms = []
             for f in all_frames():
-                if "vidmonstr.com" not in f.url and not f.url.startswith("blob:"):
+                if host not in f.url and not f.url.startswith("blob:"):
                     continue
                 try:
                     body = await f.evaluate("() => document.body ? document.body.innerHTML : ''")
                     doms.append(f"--- {f.url[:120]}\n{body[:4000]}")
                 except Exception as e:
                     doms.append(f"--- {f.url[:120]}\n(gagal dibaca: {e})")
-            own = [s for s in seen if "vidmonstr.com" in s or s.split(" ", 1)[0] in ("media", "other")]
+            own = [s for s in seen if host in s or s.split(" ", 1)[0] in ("media", "other")]
             report = (
                 f"HTTP status: {status}\nJudul: {title}\n\nFrames:\n{frames}\n\n"
                 f"<video> src: {vids or 'tidak ada'}\n\n"
-                f"Request ke vidmonstr / media ({len(own)}):\n" + "\n".join(own[-40:]) + "\n\n"
+                f"Request ke {host} / media ({len(own)}):\n" + "\n".join(own[-40:]) + "\n\n"
                 f"Request terakhir ({len(seen)} total):\n" + "\n".join(seen[-40:]) + "\n\n"
                 "Isi frame:\n" + ("\n\n".join(doms) or "(tidak ada)")
             )
@@ -439,7 +446,7 @@ def probe(c: dict, cookies: list) -> tuple[str, str]:
         return "error", str(e)[:200]
     kind = sniff(head[:4096])
     detail = f"HTTP {code}, {ctype}, awal: {head[:80]!r}"
-    if "html" in ctype.lower() and "vidmonstr.com" in c["url"]:
+    if "html" in ctype.lower() and any(d in c["url"] for d in SITES):
         # halaman dari vidmonstr sendiri: simpan isinya, mungkin berisi link video aslinya
         detail += "\n    ---- isi halaman ----\n" + head.decode("utf-8", "replace")[:6000] + "\n    ----"
     return kind, detail
@@ -820,7 +827,7 @@ def allowed(update: Update) -> bool:
 
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Kirim link vidmonstr.com/e/... atau /d/..., nanti aku kirim videonya.\n"
+        f"Kirim link {' / '.join(SITES)} (format /e/... atau /d/...), nanti aku kirim videonya.\n"
         "Bisa juga banyak link sekaligus dalam satu pesan (pisahkan dengan spasi atau baris baru)."
     )
 
@@ -829,9 +836,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     # Ambil SEMUA link di pesan (boleh dipisah spasi, baris baru, dll.), buang yang dobel.
-    ids = list(dict.fromkeys(m.group(1) for m in LINK_RE.finditer(update.message.text or "")))
+    ids = list(dict.fromkeys((m.group(1).lower(), m.group(2)) for m in LINK_RE.finditer(update.message.text or "")))
     if not ids:
-        await update.message.reply_text("Itu bukan link vidmonstr.")
+        await update.message.reply_text("Link tidak dikenali. Situs yang didukung: " + ", ".join(SITES))
         return
     if len(ids) > MAX_LINKS:
         await update.message.reply_text(
@@ -842,10 +849,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = len(ids)
     gagal = []
-    for n, video_id in enumerate(ids, 1):
+    for n, (host, video_id) in enumerate(ids, 1):
         prefix = f"[{n}/{total}] " if total > 1 else ""
         try:
-            ok = await process_one(update, context, video_id, prefix)
+            ok = await process_one(update, context, video_id, prefix, host)
         except Exception:
             # jangan sampai satu link yang error menghentikan link-link berikutnya
             log.exception("link %s gagal total", video_id)
@@ -864,14 +871,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                      video_id: str, prefix: str = "") -> bool:
+                      video_id: str, prefix: str = "", host: str = "vidmonstr.com") -> bool:
     """Proses satu link. Mengembalikan True kalau berhasil."""
     status = await update.message.reply_text(f"{prefix}⏳ Mencari video...")
     workdir = Path(tempfile.mkdtemp(prefix="vid_"))
     info = None
     try:
         async with sem:
-            info = await find_video_url(video_id, workdir)
+            info = await find_video_url(video_id, workdir, host)
             await status.edit_text(f"{prefix}⬇️ Mengunduh...")
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             path = await download(info, workdir)
