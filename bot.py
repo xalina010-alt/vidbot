@@ -51,6 +51,7 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if (BOT_API_URL or MT
 COMPRESS_RATIO = float(os.environ.get("COMPRESS_RATIO", "1.0" if MTPROTO else "1.5"))
 MAX_PARTS = int(os.environ.get("MAX_PARTS", "20"))  # batas jumlah potongan per video
 MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "1"))
+MAX_LINKS = int(os.environ.get("MAX_LINKS", "20"))  # batas jumlah link per pesan
 SNIFF_TIMEOUT = int(os.environ.get("SNIFF_TIMEOUT", "40"))  # detik menunggu link video
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
 # Tampilkan info teknis video (ukuran, rasio piksel, rotasi) di caption. Set VIDEO_INFO=0 untuk mematikan.
@@ -819,25 +820,59 @@ def allowed(update: Update) -> bool:
 
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Kirim link vidmonstr.com/e/... atau /d/..., nanti aku kirim videonya."
+        "Kirim link vidmonstr.com/e/... atau /d/..., nanti aku kirim videonya.\n"
+        "Bisa juga banyak link sekaligus dalam satu pesan (pisahkan dengan spasi atau baris baru)."
     )
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    m = LINK_RE.search(update.message.text or "")
-    if not m:
+    # Ambil SEMUA link di pesan (boleh dipisah spasi, baris baru, dll.), buang yang dobel.
+    ids = list(dict.fromkeys(m.group(1) for m in LINK_RE.finditer(update.message.text or "")))
+    if not ids:
         await update.message.reply_text("Itu bukan link vidmonstr.")
         return
+    if len(ids) > MAX_LINKS:
+        await update.message.reply_text(
+            f"⚠️ Ada {len(ids)} link, yang diproses hanya {MAX_LINKS} pertama "
+            f"(batas MAX_LINKS). Kirim sisanya di pesan berikutnya."
+        )
+        ids = ids[:MAX_LINKS]
 
-    status = await update.message.reply_text("⏳ Mencari video...")
+    total = len(ids)
+    gagal = []
+    for n, video_id in enumerate(ids, 1):
+        prefix = f"[{n}/{total}] " if total > 1 else ""
+        try:
+            ok = await process_one(update, context, video_id, prefix)
+        except Exception:
+            # jangan sampai satu link yang error menghentikan link-link berikutnya
+            log.exception("link %s gagal total", video_id)
+            ok = False
+        if not ok:
+            gagal.append(n)
+
+    if total > 1:
+        if gagal:
+            await update.message.reply_text(
+                f"Selesai: {total - len(gagal)}/{total} berhasil. "
+                f"Gagal: link ke-{', '.join(map(str, gagal))}."
+            )
+        else:
+            await update.message.reply_text(f"✅ Selesai, {total} video terkirim.")
+
+
+async def process_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      video_id: str, prefix: str = "") -> bool:
+    """Proses satu link. Mengembalikan True kalau berhasil."""
+    status = await update.message.reply_text(f"{prefix}⏳ Mencari video...")
     workdir = Path(tempfile.mkdtemp(prefix="vid_"))
     info = None
     try:
         async with sem:
-            info = await find_video_url(m.group(1), workdir)
-            await status.edit_text("⬇️ Mengunduh...")
+            info = await find_video_url(video_id, workdir)
+            await status.edit_text(f"{prefix}⬇️ Mengunduh...")
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             path = await download(info, workdir)
 
@@ -851,7 +886,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         total = len(parts)
         for i, part in enumerate(parts, 1):
-            label = f"⬆️ Mengirim bagian {i}/{total}..." if total > 1 else "⬆️ Mengirim..."
+            label = prefix + (f"⬆️ Mengirim bagian {i}/{total}..." if total > 1 else "⬆️ Mengirim...")
             await status.edit_text(label)
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             meta = await video_meta(part)
@@ -877,9 +912,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kwargs.pop("cover", None)
                 await update.message.reply_video(part, **kwargs)
         await status.delete()
+        return True
     except NotFound as e:
         log.warning("tidak ketemu:\n%s", e.report)
-        await status.edit_text(f"❌ {e}")
+        await status.edit_text(f"{prefix}❌ {e}")
         if e.screenshot:
             await update.message.reply_photo(e.screenshot, caption="Screenshot halaman yang dilihat bot")
         if e.report:
@@ -889,7 +925,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(f, filename="diagnosis.txt")
     except Exception as e:
         log.exception("gagal")
-        await status.edit_text(f"❌ {str(e)[:900]}")
+        await status.edit_text(f"{prefix}❌ {str(e)[:900]}")
         rpt_text = (info or {}).get("report")
         if rpt_text:
             rpt = Path(workdir) / "kandidat.txt"
@@ -898,6 +934,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_document(f, filename="kandidat.txt")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+    return False
 
 
 def main():
