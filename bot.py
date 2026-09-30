@@ -186,9 +186,75 @@ async def grab_cover(ctx, frames, workdir: Path) -> Path | None:
     return None
 
 
+# ---------------------------------------------------------------- situs dengan API /api/stream
+# Sebagian situs (mis. fiuosba.com, player "Vidara") tidak menaruh link video di halaman. Player-nya
+# memanggil POST /api/stream {"filecode": ID} dan mendapat JSON berisi "streaming_url". Bot langsung
+# memanggil API itu (lebih cepat dan tidak ketahuan sebagai browser otomatis). Kalau tidak berhasil,
+# bot tetap lanjut ke cara lama lewat browser.
+def api_stream(host: str, video_id: str) -> tuple[dict | None, str]:
+    """Kembalikan (data JSON atau None, catatan untuk diagnosis)."""
+    page_url = f"https://{host}/e/{video_id}"
+    body = json.dumps({"filecode": video_id, "device": "web"}).encode()
+    req = urllib.request.Request(
+        f"https://{host}/api/stream", data=body, method="POST",
+        headers={
+            "user-agent": USER_AGENT, "content-type": "application/json",
+            "accept": "application/json, text/plain, */*",
+            "origin": f"https://{host}", "referer": page_url,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read(200000)
+            code = r.status
+    except Exception as e:
+        return None, f"POST /api/stream gagal: {str(e)[:200]}"
+    note = f"POST /api/stream -> HTTP {code}, isi: {raw[:600].decode('utf-8', 'replace')}"
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, note + "\n(bukan JSON, mungkin terenkripsi)"
+    return (data if isinstance(data, dict) else None), note
+
+
+def fetch_file(url: str, referer: str, out: Path) -> Path | None:
+    try:
+        req = urllib.request.Request(url, headers={"user-agent": USER_AGENT, "referer": referer})
+        with urllib.request.urlopen(req, timeout=20) as r, out.open("wb") as f:
+            shutil.copyfileobj(r, f)
+        return out if out.stat().st_size > 0 else None
+    except Exception:
+        return None
+
+
+async def find_via_api(host: str, video_id: str, workdir: Path) -> tuple[dict | None, str]:
+    data, note = await asyncio.to_thread(api_stream, host, video_id)
+    url = (data or {}).get("streaming_url") or ""
+    if not url.startswith("http"):
+        return None, note
+    page_url = f"https://{host}/e/{video_id}"
+    c = {"url": url, "referer": page_url, "how": "api /api/stream"}
+    kind, detail = await asyncio.to_thread(probe, c, [])
+    if kind not in ("hls", "mp4", "webm", "ts"):
+        # isi tidak bisa ditebak dari 4 KB pertama: tebak dari alamatnya
+        kind = "hls" if ".m3u8" in url else "mp4" if ".mp4" in url else kind
+    if kind not in ("hls", "mp4", "webm", "ts"):
+        return None, f"{note}\nstreaming_url: {url[:200]}\n  diperiksa: [{kind}] {detail}"
+    cover = None
+    thumb = data.get("thumbnail") or ""
+    if thumb.startswith("http"):
+        cover = await asyncio.to_thread(fetch_file, thumb, page_url, workdir / "cover_api.jpg")
+    log.info("video lewat API [%s]: %s", kind, url[:200])
+    return {**c, "kind": kind, "cookies": [], "report": f"[{kind}] (api) {url[:200]}",
+            "cover_file": str(cover) if cover else None}, note
+
+
 async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.com") -> dict:
     """Kembalikan {'url', 'referer', 'kind', 'cookies'} atau raise NotFound."""
     page_url = f"https://{host}/e/{video_id}"
+    api_info, api_note = await find_via_api(host, video_id, workdir)
+    if api_info:
+        return api_info
     cands: list[dict] = []  # semua link yang mungkin video
     seen: list[str] = []  # log request untuk diagnosis
     first_hit: list[float] = []
@@ -219,7 +285,22 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
             if VIDEO_RE.search(req.url):
                 add(req.url, req.headers.get("referer"), "url", req)
 
+        api_seen: list[str] = []
+
+        async def read_api(resp):
+            # respons /api/stream yang diterima player di browser (cadangan kalau panggilan langsung gagal)
+            try:
+                data = await resp.json()
+                api_seen.append(json.dumps(data)[:600])
+                url = (data or {}).get("streaming_url") or ""
+                if url.startswith("http"):
+                    add(url, page_url, "api (browser)")
+            except Exception as e:
+                api_seen.append(f"(gagal dibaca: {e})")
+
         def on_response(resp):
+            if resp.url.split("?", 1)[0].endswith("/api/stream"):
+                asyncio.ensure_future(read_api(resp))
             ctype = (resp.headers.get("content-type") or "").lower()
             if any(t in ctype for t in VIDEO_TYPES) or resp.request.resource_type == "media":
                 add(resp.url, resp.request.headers.get("referer"), f"type {ctype[:30]}", resp.request)
@@ -391,7 +472,12 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
     good = sorted((c for c in cands if c["kind"] in rank),
                   key=lambda c: (0 if c.get("body_file") else 1, rank[c["kind"]]))
     if not good:
-        report = "Kandidat yang diperiksa:\n" + ("\n".join(probes) or "  (tidak ada)") + "\n\n" + report
+        report = (
+            "Kandidat yang diperiksa:\n" + ("\n".join(probes) or "  (tidak ada)") + "\n\n"
+            + f"API langsung: {api_note}\n"
+            + ("API di browser: " + " | ".join(api_seen) + "\n" if api_seen else "")
+            + "\n" + report
+        )
         raise NotFound(
             "Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis).",
             shot, report,
