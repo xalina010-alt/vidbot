@@ -181,6 +181,9 @@ async def grab_from_browser(c: dict, workdir: Path) -> None:
         body = await asyncio.wait_for(resp.body(), BODY_TIMEOUT)
         kind = sniff(body[:4096])
         c["browser"] += f", {len(body) / 1024 / 1024:.1f} MB, isi: {kind}"
+        if kind == "bukan-video" and len(body) < 20000:
+            text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", body.decode("utf-8", "replace"))).strip()
+            c["browser"] += f", pesan server: {text[:300] or '(kosong)'}"
         if kind in ("mp4", "webm", "ts"):
             f = workdir / f"browser.{kind}"
             f.write_bytes(body)
@@ -403,6 +406,41 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
             return f ? f.src : null;
         }"""
         player_notes: list[str] = []
+        view_done: list[bool] = []
+
+        # Halaman vidovr mencatat "view" lewat POST /aclck (videoId + viewToken) sebelum video diputar.
+        # Server video kemungkinan menolak (403) kalau view ini belum tercatat, jadi bot mengirimnya sendiri.
+        ACLCK_JS = r"""async () => {
+            const h = document.documentElement.innerHTML;
+            const id = (h.match(/videoId\s*=\s*["']([^"']+)["']/) || [])[1];
+            const vt = (h.match(/viewToken\s*=\s*["']([^"']+)["']/) || [])[1];
+            if (!id || !vt) return null;
+            const p = new URLSearchParams({id, vt, fp: '', bot: '0', mobile: '0', touch: '0',
+                screen: '1920x1080', tz: 'Asia/Jakarta', lang: 'en-US'});
+            try {
+                const r = await fetch('/aclck', {method: 'POST', credentials: 'same-origin',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+                              'X-Requested-With': 'XMLHttpRequest'}, body: p.toString()});
+                return 'HTTP ' + r.status + ' ' + (await r.text()).slice(0, 120);
+            } catch (e) { return 'gagal: ' + e; }
+        }"""
+
+        async def register_view():
+            if view_done:
+                return
+            for frame in list(all_frames()):
+                if host not in frame.url:
+                    continue
+                try:
+                    res = await frame.evaluate(ACLCK_JS)
+                except Exception as e:
+                    res = None
+                    log.info("aclck gagal: %s", e)
+                if res:
+                    view_done.append(True)
+                    player_notes.append(f"/aclck: {res}")
+                    log.info("aclck: %s", res)
+                    return
 
         async def player_url() -> tuple[str | None, str | None]:
             """(alamat player, referer) atau (None, None) kalau player sudah terbuka / tidak ketemu."""
@@ -443,6 +481,7 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
             # Kalau player belum muncul juga, buka halaman player stream.php langsung
             # (itu yang dilakukan tombol play), dengan referer frame player.
             if rounds in (2, 4, 7) and not first_hit and not opened_player:
+                await register_view()
                 url, ref = await player_url()
                 if url:
                     opened_player = True
