@@ -109,7 +109,7 @@ def clean_headers(headers: dict) -> dict:
 
 
 LINK_RE = re.compile(
-    r"https?://(?:www\.)?(" + "|".join(re.escape(d) for d in SITES) + r")/(?:e|d)/([A-Za-z0-9]+)",
+    r"https?://(?:www\.)?(" + "|".join(re.escape(d) for d in SITES) + r")/(e|d)/([A-Za-z0-9]+)",
     re.I,
 )
 # .m3u8/.mp4 biasa, plus stream.php milik vidmonstr (player-nya mengambil video dari sini lalu
@@ -295,9 +295,9 @@ async def find_via_api(host: str, video_id: str, workdir: Path) -> tuple[dict | 
             "cover_file": str(cover) if cover else None}, note
 
 
-async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.com") -> dict:
+async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.com", path: str = "e") -> dict:
     """Kembalikan {'url', 'referer', 'kind', 'cookies'} atau raise NotFound."""
-    page_url = f"https://{host}/e/{video_id}"
+    page_url = f"https://{host}/{path}/{video_id}"
     api_info, api_note = await find_via_api(host, video_id, workdir)
     if api_info:
         return api_info
@@ -326,7 +326,8 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
             headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"]
         )
         ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720},
-                                        extra_http_headers=CLIENT_HINTS, locale="en-US")
+                                        extra_http_headers=CLIENT_HINTS, locale="en-US",
+                                        accept_downloads=True)
         await ctx.add_init_script(STEALTH_JS)
 
         def on_request(req):
@@ -361,10 +362,42 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
         page = await ctx.new_page()
         keep: list = []  # halaman player yang sengaja dibuka bot (jangan ditutup)
 
-        # Tab iklan yang dibuka otomatis langsung ditutup.
+        # File yang diunduh lewat tombol "Download" (halaman /d/) ditangkap dan disimpan.
+        dl_tasks: list = []
+        dl_pages: set = set()
+        dl_notes: list[str] = []
+
+        async def save_download(dl):
+            name = dl.suggested_filename or "download"
+            out = workdir / f"dl_{len(dl_tasks)}_{re.sub(r'[^A-Za-z0-9._-]', '_', name)[-60:]}"
+            try:
+                await dl.save_as(str(out))
+                with out.open("rb") as f:
+                    kind = sniff(f.read(4096))
+                size = out.stat().st_size
+                dl_notes.append(f"{name} ({size / 1024 / 1024:.1f} MB, {kind}) dari {dl.url[:120]}")
+                if kind in ("mp4", "webm", "ts") and size > 0:
+                    cands.append({"url": dl.url, "referer": page_url, "how": "download",
+                                  "body_file": str(out), "kind": kind})
+                    if not first_hit:
+                        first_hit.append(time.monotonic())
+            except Exception as e:
+                dl_notes.append(f"{name}: gagal disimpan: {str(e)[:150]}")
+
+        def on_download(dl):
+            dl_pages.add(dl.page)
+            dl_tasks.append(asyncio.ensure_future(save_download(dl)))
+
+        def watch(pg):
+            pg.on("download", on_download)
+
+        watch(page)
+
+        # Tab iklan yang dibuka otomatis langsung ditutup (kecuali tab yang sedang mengunduh file).
         async def close_popup(new_page):
-            await asyncio.sleep(0.5)
-            if new_page != page and new_page not in keep:
+            watch(new_page)
+            await asyncio.sleep(1.5)
+            if new_page != page and new_page not in keep and new_page not in dl_pages:
                 try:
                     await new_page.close()
                 except Exception:
@@ -494,9 +527,29 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
                     return c["url"], player_referer
             return None, None
 
+        # Halaman unduhan (/d/): klik tombol "Download" yang terlihat (sering muncul setelah hitung mundur).
+        CLICK_DOWNLOAD = r"""() => {
+            document.querySelectorAll('a[style*="position: fixed"], div[style*="opacity: 0.01"]')
+                .forEach(el => el.remove());
+            const re = /download|unduh|get\s*link|generate/i;
+            const els = [...document.querySelectorAll('a, button, input[type=submit], input[type=button]')];
+            for (const el of els) {
+                const label = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+                const href = el.getAttribute('href') || '';
+                if (!re.test(label) && !/download/i.test(href)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 5 || r.height < 5 || el.disabled) continue;
+                if (el.dataset.vbClicked) continue;
+                el.dataset.vbClicked = '1';
+                el.click();
+                return label.slice(0, 40) || href.slice(0, 80);
+            }
+            return null;
+        }"""
+
         player_referer = page_url
         opened_player = False
-        deadline = time.monotonic() + SNIFF_TIMEOUT
+        deadline = time.monotonic() + SNIFF_TIMEOUT + (30 if path == "d" else 0)
         rounds = 0
         while time.monotonic() < deadline:
             # setelah bukti kuat pertama, tunggu 6 detik lagi untuk mengumpulkan kandidat lain
@@ -516,6 +569,20 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
                         pass
             # Kalau player belum muncul juga, buka halaman player stream.php langsung
             # (itu yang dilakukan tombol play), dengan referer frame player.
+            if path == "d" and rounds <= 15:
+                for frame in list(all_frames()):
+                    if host not in frame.url:
+                        continue
+                    try:
+                        clicked = await frame.evaluate(CLICK_DOWNLOAD)
+                        if clicked:
+                            player_notes.append(f"klik tombol unduh (putaran {rounds}): {clicked}")
+                            log.info("klik tombol unduh: %s", clicked)
+                    except Exception:
+                        pass
+            if dl_tasks and not all(t.done() for t in dl_tasks):
+                await asyncio.sleep(2)
+                continue  # unduhan sedang berjalan: jangan berhenti dulu
             if rounds >= 2 and not view_done and rounds <= 8:
                 await register_view()
             if rounds in (2, 4, 7) and not first_hit and not opened_player:
@@ -596,8 +663,18 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
                 f"Request terakhir ({len(seen)} total):\n" + "\n".join(seen[-40:]) + "\n\n"
                 "Isi frame:\n" + ("\n\n".join(doms) or "(tidak ada)")
             )
+        # Tunggu unduhan yang sedang berjalan selesai (sebelum browser ditutup).
+        if dl_tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*dl_tasks, return_exceptions=True), BODY_TIMEOUT)
+            except asyncio.TimeoutError:
+                dl_notes.append(f"unduhan belum selesai setelah {BODY_TIMEOUT} detik")
+        if dl_notes:
+            report = "Unduhan lewat tombol:\n  " + "\n  ".join(dl_notes) + "\n\n" + report
         # Ambil header asli + isi respons dari browser untuk tiap kandidat (sebelum browser ditutup).
         for c in cands:
+            if c.get("body_file"):
+                continue
             await grab_from_browser(c, workdir)
         cover_file = await grab_cover(ctx, list(all_frames()), workdir)
         cookies = await ctx.cookies()
@@ -1094,7 +1171,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     # Ambil SEMUA link di pesan (boleh dipisah spasi, baris baru, dll.), buang yang dobel.
-    ids = list(dict.fromkeys((m.group(1).lower(), m.group(2)) for m in LINK_RE.finditer(update.message.text or "")))
+    ids = list(dict.fromkeys((m.group(1).lower(), m.group(2).lower(), m.group(3))
+                             for m in LINK_RE.finditer(update.message.text or "")))
     if not ids:
         await update.message.reply_text("Link tidak dikenali. Situs yang didukung: " + ", ".join(SITES))
         return
@@ -1107,10 +1185,10 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total = len(ids)
     gagal = []
-    for n, (host, video_id) in enumerate(ids, 1):
+    for n, (host, path, video_id) in enumerate(ids, 1):
         prefix = f"[{n}/{total}] " if total > 1 else ""
         try:
-            ok = await process_one(update, context, video_id, prefix, host)
+            ok = await process_one(update, context, video_id, prefix, host, path)
         except Exception:
             # jangan sampai satu link yang error menghentikan link-link berikutnya
             log.exception("link %s gagal total", video_id)
@@ -1129,14 +1207,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                      video_id: str, prefix: str = "", host: str = "vidmonstr.com") -> bool:
+                      video_id: str, prefix: str = "", host: str = "vidmonstr.com",
+                      path: str = "e") -> bool:
     """Proses satu link. Mengembalikan True kalau berhasil."""
     status = await update.message.reply_text(f"{prefix}⏳ Mencari video...")
     workdir = Path(tempfile.mkdtemp(prefix="vid_"))
     info = None
     try:
         async with sem:
-            info = await find_video_url(video_id, workdir, host)
+            try:
+                info = await find_video_url(video_id, workdir, host, path)
+            except NotFound as e_d:
+                if path != "d":
+                    raise
+                # halaman unduhan /d/ gagal: coba halaman player /e/
+                log.info("halaman /d/ gagal, coba /e/: %s", e_d)
+                await status.edit_text(f"{prefix}⏳ Halaman unduhan gagal, coba lewat player...")
+                try:
+                    info = await find_video_url(video_id, workdir, host, "e")
+                except NotFound as e_e:
+                    e_e.report = (f"===== Percobaan 1: halaman /d/ =====\n{e_d.report}\n\n"
+                                  f"===== Percobaan 2: halaman /e/ =====\n{e_e.report}")
+                    e_e.screenshot = e_e.screenshot or e_d.screenshot
+                    raise e_e
             await status.edit_text(f"{prefix}⬇️ Mengunduh...")
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
             path = await download(info, workdir)
