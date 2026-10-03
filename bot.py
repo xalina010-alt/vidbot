@@ -57,24 +57,106 @@ MAX_LINKS = int(os.environ.get("MAX_LINKS", "20"))  # batas jumlah link per pesa
 # server (mis. vidovr: "country_blocked" untuk IP Amerika, tempat server Heroku berada).
 # Format: http://user:pass@host:port  (http/https; socks5://... hanya untuk browser & yt-dlp).
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+# Kalau situs memblokir negara server dan PROXY_URL kosong, bot otomatis mencoba proxy GRATIS dari
+# daftar publik (negara di PROXY_COUNTRIES). AUTO_PROXY=0 untuk mematikan.
+AUTO_PROXY = os.environ.get("AUTO_PROXY", "1") != "0"
+AUTO_PROXY_TRIES = int(os.environ.get("AUTO_PROXY_TRIES", "4"))  # berapa proxy dicoba per video
+PROXY_COUNTRIES = [c.strip().upper() for c in os.environ.get("PROXY_COUNTRIES", "ID,SG,MY,TH,VN,PH").split(",") if c.strip()]
 PROXY_ENV = dict(os.environ)
-if PROXY_URL:
-    for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
-        PROXY_ENV[_k] = PROXY_URL
-    # semua urllib.request.urlopen di bot ini (unduh, cek video, API) lewat proxy
+_PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+_current_proxy = ""
+
+
+def set_proxy(url: str) -> None:
+    """Pasang proxy untuk pengambilan video (browser, urllib, ffmpeg, yt-dlp). Kosong = tanpa proxy."""
+    global _current_proxy
+    _current_proxy = url or ""
+    for k in _PROXY_KEYS:
+        if url:
+            PROXY_ENV[k] = url
+        else:
+            PROXY_ENV.pop(k, None)
     urllib.request.install_opener(urllib.request.build_opener(
-        urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})))
+        urllib.request.ProxyHandler({"http": url, "https": url} if url else {})))
+
+
+set_proxy(PROXY_URL)
 
 
 def playwright_proxy() -> dict | None:
-    if not PROXY_URL:
+    if not _current_proxy:
         return None
-    u = urllib.parse.urlparse(PROXY_URL)
+    u = urllib.parse.urlparse(_current_proxy)
     cfg = {"server": f"{u.scheme}://{u.hostname}:{u.port}" if u.port else f"{u.scheme}://{u.hostname}"}
     if u.username:
         cfg["username"] = urllib.parse.unquote(u.username)
         cfg["password"] = urllib.parse.unquote(u.password or "")
     return cfg
+
+
+# ---------------------------------------------------------------- proxy gratis otomatis
+FREE_PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&country={cc}"
+    "&protocol=http&proxy_format=protocolipport&format=text&timeout=8000",
+    "https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked"
+    "&sort_type=desc&country={CC}&protocols=http%2Chttps",
+]
+_free_cache: dict = {"at": 0.0, "list": []}
+
+
+def _fetch_free_list() -> list[str]:
+    """Kumpulkan alamat proxy http gratis dari daftar publik (tanpa proxy)."""
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    found: list[str] = []
+    for cc in PROXY_COUNTRIES:
+        for src in FREE_PROXY_SOURCES:
+            url = src.format(cc=cc.lower(), CC=cc)
+            try:
+                with direct.open(urllib.request.Request(url, headers={"user-agent": USER_AGENT}), timeout=15) as r:
+                    raw = r.read(500000).decode("utf-8", "replace")
+            except Exception as e:
+                log.info("daftar proxy %s gagal: %s", url[:60], e)
+                continue
+            if raw.lstrip().startswith("{"):
+                try:
+                    for it in json.loads(raw).get("data", []):
+                        found.append(f"http://{it['ip']}:{it['port']}")
+                except Exception:
+                    pass
+            else:
+                found += [f"http://{ip}:{port}" for ip, port in
+                          re.findall(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})", raw)]
+    return list(dict.fromkeys(found))
+
+
+def _test_proxy(proxy: str, host: str) -> float | None:
+    """Detik yang dibutuhkan proxy untuk membuka https://host/, atau None kalau gagal."""
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    t0 = time.monotonic()
+    try:
+        with op.open(urllib.request.Request(f"https://{host}/", headers={"user-agent": USER_AGENT}),
+                     timeout=8) as r:
+            if r.status != 200 or not r.read(2000):
+                return None
+    except Exception:
+        return None
+    return time.monotonic() - t0
+
+
+def find_free_proxies(host: str, want: int) -> list[str]:
+    """Proxy gratis yang terbukti bisa membuka situs, urut dari yang tercepat (disimpan 20 menit)."""
+    from concurrent.futures import ThreadPoolExecutor
+    if time.monotonic() - _free_cache["at"] > 1200 or not _free_cache["list"]:
+        _free_cache["list"] = _fetch_free_list()
+        _free_cache["at"] = time.monotonic()
+    pool = _free_cache["list"][:150]
+    if not pool:
+        return []
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        speeds = list(ex.map(lambda pr: (_test_proxy(pr, host), pr), pool))
+    ok = sorted((t, pr) for t, pr in speeds if t is not None)
+    log.info("proxy gratis: %d dari %d bisa dipakai", len(ok), len(pool))
+    return [pr for _, pr in ok[:want]]
 SNIFF_TIMEOUT = int(os.environ.get("SNIFF_TIMEOUT", "40"))  # detik menunggu link video
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
 # Tampilkan info teknis video (ukuran, rasio piksel, rotasi) di caption. Set VIDEO_INFO=0 untuk mematikan.
@@ -728,7 +810,7 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
         blocked = "country_blocked" in report
         raise NotFound(
             ("Situs ini memblokir negara server bot (Amerika). Isi Config Var PROXY_URL dengan proxy "
-             "di luar Amerika (mis. Indonesia/Singapura), lalu coba lagi." if blocked and not PROXY_URL else
+             "di luar Amerika (mis. Indonesia/Singapura), lalu coba lagi." if blocked and not _current_proxy else
              "Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis)."),
             shot, report,
         )
@@ -1240,26 +1322,65 @@ async def process_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
     status = await update.message.reply_text(f"{prefix}⏳ Mencari video...")
     workdir = Path(tempfile.mkdtemp(prefix="vid_"))
     info = None
+    async def find_with_fallback(use_path: str) -> dict:
+        try:
+            return await find_video_url(video_id, workdir, host, use_path)
+        except NotFound as e_d:
+            if use_path != "d" or "country_blocked" in (e_d.report or ""):
+                raise  # diblokir negara: halaman /e/ pasti sama saja, langsung ke proxy
+            # halaman unduhan /d/ gagal: coba halaman player /e/
+            log.info("halaman /d/ gagal, coba /e/: %s", e_d)
+            await status.edit_text(f"{prefix}⏳ Halaman unduhan gagal, coba lewat player...")
+            try:
+                return await find_video_url(video_id, workdir, host, "e")
+            except NotFound as e_e:
+                e_e.report = (f"===== Percobaan 1: halaman /d/ =====\n{e_d.report}\n\n"
+                              f"===== Percobaan 2: halaman /e/ =====\n{e_e.report}")
+                e_e.screenshot = e_e.screenshot or e_d.screenshot
+                raise e_e
+
+    async def find_and_download(use_path: str):
+        info = await find_with_fallback(use_path)
+        await status.edit_text(f"{prefix}⬇️ Mengunduh...")
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+        return info, await download(info, workdir)
+
     try:
         async with sem:
             try:
-                info = await find_video_url(video_id, workdir, host, path)
-            except NotFound as e_d:
-                if path != "d":
+                info, path = await find_and_download(path)
+            except NotFound as blocked:
+                # Situs memblokir negara server (Amerika): coba otomatis lewat proxy gratis Asia.
+                if not ("country_blocked" in (blocked.report or "") and AUTO_PROXY and not PROXY_URL):
                     raise
-                # halaman unduhan /d/ gagal: coba halaman player /e/
-                log.info("halaman /d/ gagal, coba /e/: %s", e_d)
-                await status.edit_text(f"{prefix}⏳ Halaman unduhan gagal, coba lewat player...")
-                try:
-                    info = await find_video_url(video_id, workdir, host, "e")
-                except NotFound as e_e:
-                    e_e.report = (f"===== Percobaan 1: halaman /d/ =====\n{e_d.report}\n\n"
-                                  f"===== Percobaan 2: halaman /e/ =====\n{e_e.report}")
-                    e_e.screenshot = e_e.screenshot or e_d.screenshot
-                    raise e_e
-            await status.edit_text(f"{prefix}⬇️ Mengunduh...")
-            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
-            path = await download(info, workdir)
+                await status.edit_text(f"{prefix}🌏 Situs memblokir server Amerika, mencari proxy gratis...")
+                proxies = await asyncio.to_thread(find_free_proxies, host, AUTO_PROXY_TRIES)
+                if not proxies:
+                    blocked.args = ("Situs memblokir server Amerika dan tidak ada proxy gratis yang bisa "
+                                    "dipakai saat ini. Coba lagi nanti, atau isi PROXY_URL.",)
+                    raise blocked
+                last = blocked
+                info = None
+                for k, pr in enumerate(proxies, 1):
+                    await status.edit_text(f"{prefix}🌏 Mencoba proxy gratis {k}/{len(proxies)}...")
+                    set_proxy(pr)
+                    try:
+                        info, path = await find_and_download("e")
+                        log.info("berhasil lewat proxy gratis %s", pr)
+                        break
+                    except Exception as e:
+                        log.info("proxy gratis %s gagal: %s", pr, e)
+                        last = e
+                        for f in workdir.iterdir():  # sisa unduhan gagal
+                            if f.is_file() and f.name.startswith(("video", "direct", "browser", "dl_")):
+                                f.unlink(missing_ok=True)
+                    finally:
+                        set_proxy(PROXY_URL)
+                if info is None:
+                    if isinstance(last, NotFound):
+                        last.args = (f"Situs memblokir server Amerika; {len(proxies)} proxy gratis sudah "
+                                     "dicoba tapi gagal (proxy gratis sering lambat/mati). Coba lagi nanti.",)
+                    raise last
 
         info_asli = await tech_info(path) if VIDEO_INFO else ""
         path = await fix_aspect(path, workdir, status)
