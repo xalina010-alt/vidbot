@@ -53,6 +53,28 @@ COMPRESS_RATIO = float(os.environ.get("COMPRESS_RATIO", "1.0" if MTPROTO else "1
 MAX_PARTS = int(os.environ.get("MAX_PARTS", "20"))  # batas jumlah potongan per video
 MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "1"))
 MAX_LINKS = int(os.environ.get("MAX_LINKS", "20"))  # batas jumlah link per pesan
+# Proxy untuk mengambil video (BUKAN untuk koneksi ke Telegram). Dipakai kalau situs memblokir negara
+# server (mis. vidovr: "country_blocked" untuk IP Amerika, tempat server Heroku berada).
+# Format: http://user:pass@host:port  (http/https; socks5://... hanya untuk browser & yt-dlp).
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+PROXY_ENV = dict(os.environ)
+if PROXY_URL:
+    for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        PROXY_ENV[_k] = PROXY_URL
+    # semua urllib.request.urlopen di bot ini (unduh, cek video, API) lewat proxy
+    urllib.request.install_opener(urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": PROXY_URL, "https": PROXY_URL})))
+
+
+def playwright_proxy() -> dict | None:
+    if not PROXY_URL:
+        return None
+    u = urllib.parse.urlparse(PROXY_URL)
+    cfg = {"server": f"{u.scheme}://{u.hostname}:{u.port}" if u.port else f"{u.scheme}://{u.hostname}"}
+    if u.username:
+        cfg["username"] = urllib.parse.unquote(u.username)
+        cfg["password"] = urllib.parse.unquote(u.password or "")
+    return cfg
 SNIFF_TIMEOUT = int(os.environ.get("SNIFF_TIMEOUT", "40"))  # detik menunggu link video
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
 # Tampilkan info teknis video (ukuran, rasio piksel, rotasi) di caption. Set VIDEO_INFO=0 untuk mematikan.
@@ -323,7 +345,8 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"]
+            headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"],
+            proxy=playwright_proxy(),
         )
         ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720},
                                         extra_http_headers=CLIENT_HINTS, locale="en-US",
@@ -702,8 +725,11 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
             + ("API di browser: " + " | ".join(api_seen) + "\n" if api_seen else "")
             + "\n" + report
         )
+        blocked = "country_blocked" in report
         raise NotFound(
-            "Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis).",
+            ("Situs ini memblokir negara server bot (Amerika). Isi Config Var PROXY_URL dengan proxy "
+             "di luar Amerika (mis. Indonesia/Singapura), lalu coba lagi." if blocked and not PROXY_URL else
+             "Link video tidak ditemukan (mungkin video dihapus, atau situs menolak akses otomatis)."),
             shot, report,
         )
     best = good[0]
@@ -876,7 +902,7 @@ async def download(info: dict, workdir: Path) -> Path:
         "-o", out_tpl, info["url"],
     ]
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=PROXY_ENV
     )
     _, err = await proc.communicate()
     files = sorted(f for f in workdir.glob("video.*") if f.stat().st_size > 0)
@@ -901,8 +927,9 @@ LIMIT_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 
 async def run(*cmd: str) -> str:
+    # ffmpeg membaca http_proxy dari env (dipakai saat mengunduh HLS; file lokal tidak terpengaruh)
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=PROXY_ENV
     )
     out, err = await proc.communicate()
     if proc.returncode != 0:
@@ -1307,7 +1334,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     log.info("bot jalan (batas upload %d MB%s)", MAX_UPLOAD_MB,
-             ", local API" if BOT_API_URL else ", MTProto" if MTPROTO else "")
+             (", local API" if BOT_API_URL else ", MTProto" if MTPROTO else "")
+             + (", proxy aktif untuk unduhan" if PROXY_URL else ""))
     app.run_polling()
 
 
