@@ -315,8 +315,8 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
             first_hit.append(time.monotonic())
         for c in cands:
             if c["url"] == url:
-                if req and not c.get("req"):
-                    c["req"] = req
+                if req:
+                    c["req"] = req  # pakai request terbaru (mis. setelah view tercatat)
                 return
         cands.append({"url": url, "referer": referer or page_url, "how": how, "req": req})
         log.info("kandidat (%s): %s", how, url[:200])
@@ -407,6 +407,8 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
         }"""
         player_notes: list[str] = []
         view_done: list[bool] = []
+        view_pending = False  # True kalau halaman punya viewToken tapi view belum tercatat
+        view_reload_at: list[float] = []
 
         # Halaman vidovr mencatat "view" lewat POST /aclck (videoId + viewToken) sebelum video diputar.
         # Server video kemungkinan menolak (403) kalau view ini belum tercatat, jadi bot mengirimnya sendiri.
@@ -415,8 +417,24 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
             const id = (h.match(/videoId\s*=\s*["']([^"']+)["']/) || [])[1];
             const vt = (h.match(/viewToken\s*=\s*["']([^"']+)["']/) || [])[1];
             if (!id || !vt) return null;
-            const p = new URLSearchParams({id, vt, fp: '', bot: '0', mobile: '0', touch: '0',
-                screen: '1920x1080', tz: 'Asia/Jakarta', lang: 'en-US'});
+            // Sidik jari wajib (tanpa ini server menjawab "missing_fingerprint"). Pakai FingerprintJS
+            // yang sama dengan halaman aslinya.
+            let fp = '';
+            try {
+                const mod = await import('https://openfpcdn.io/fingerprintjs/v3');
+                const agent = await mod.load();
+                fp = ((await agent.get()) || {}).visitorId || '';
+            } catch (e) {}
+            if (!fp) {
+                // cadangan: hash sederhana dari ciri browser, tetap 32 karakter hex seperti visitorId
+                const src = [navigator.userAgent, navigator.language, screen.width, screen.height,
+                             screen.colorDepth, new Date().getTimezoneOffset(), navigator.hardwareConcurrency].join('|');
+                const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(src));
+                fp = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+            }
+            const p = new URLSearchParams({id, vt, fp, bot: '0', mobile: '0', touch: '0',
+                screen: screen.width + 'x' + screen.height,
+                tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Jakarta', lang: navigator.language || 'en-US'});
             try {
                 const r = await fetch('/aclck', {method: 'POST', credentials: 'same-origin',
                     headers: {'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
@@ -426,20 +444,36 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
         }"""
 
         async def register_view():
+            nonlocal view_pending
             if view_done:
                 return
             for frame in list(all_frames()):
                 if host not in frame.url:
                     continue
                 try:
+                    if await frame.evaluate("() => /viewToken\\s*=/.test(document.documentElement.innerHTML)"):
+                        view_pending = True
+                except Exception:
+                    pass
+                try:
                     res = await frame.evaluate(ACLCK_JS)
                 except Exception as e:
                     res = None
                     log.info("aclck gagal: %s", e)
                 if res:
+                    view_pending = False
                     view_done.append(True)
                     player_notes.append(f"/aclck: {res}")
                     log.info("aclck: %s", res)
+                    if res.startswith("HTTP 2"):
+                        view_reload_at.append(time.monotonic())
+                        # player yang sudah terbuka sebelum view tercatat: muat ulang supaya video diminta lagi
+                        for f in list(all_frames()):
+                            if "/stream.php?" in f.url:
+                                try:
+                                    await f.evaluate("() => location.reload()")
+                                except Exception:
+                                    pass
                     return
 
         async def player_url() -> tuple[str | None, str | None]:
@@ -466,8 +500,10 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
         rounds = 0
         while time.monotonic() < deadline:
             # setelah bukti kuat pertama, tunggu 6 detik lagi untuk mengumpulkan kandidat lain
-            if first_hit and time.monotonic() - first_hit[0] > 6:
-                break
+            # (kalau situs butuh /aclck, tunggu sampai view tercatat dulu supaya video diminta ulang)
+            if first_hit and time.monotonic() - first_hit[0] > 6 and (not view_pending or rounds > 10):
+                if not view_reload_at or time.monotonic() - view_reload_at[0] > 8:
+                    break
             rounds += 1
             if rounds <= 3:
                 for frame in list(all_frames()):
@@ -480,8 +516,9 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
                         pass
             # Kalau player belum muncul juga, buka halaman player stream.php langsung
             # (itu yang dilakukan tombol play), dengan referer frame player.
-            if rounds in (2, 4, 7) and not first_hit and not opened_player:
+            if rounds >= 2 and not view_done and rounds <= 8:
                 await register_view()
+            if rounds in (2, 4, 7) and not first_hit and not opened_player:
                 url, ref = await player_url()
                 if url:
                     opened_player = True
