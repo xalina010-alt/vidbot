@@ -143,6 +143,9 @@ def _test_proxy(proxy: str, host: str) -> float | None:
     return time.monotonic() - t0
 
 
+FREE_PROXY_STATS = {"fetched": 0, "tested": 0, "ok": 0}
+
+
 def find_free_proxies(host: str, want: int) -> list[str]:
     """Proxy gratis yang terbukti bisa membuka situs, urut dari yang tercepat (disimpan 20 menit)."""
     from concurrent.futures import ThreadPoolExecutor
@@ -150,11 +153,13 @@ def find_free_proxies(host: str, want: int) -> list[str]:
         _free_cache["list"] = _fetch_free_list()
         _free_cache["at"] = time.monotonic()
     pool = _free_cache["list"][:150]
+    FREE_PROXY_STATS.update(fetched=len(_free_cache["list"]), tested=len(pool), ok=0)
     if not pool:
         return []
     with ThreadPoolExecutor(max_workers=30) as ex:
         speeds = list(ex.map(lambda pr: (_test_proxy(pr, host), pr), pool))
     ok = sorted((t, pr) for t, pr in speeds if t is not None)
+    FREE_PROXY_STATS["ok"] = len(ok)
     log.info("proxy gratis: %d dari %d bisa dipakai", len(ok), len(pool))
     return [pr for _, pr in ok[:want]]
 SNIFF_TIMEOUT = int(os.environ.get("SNIFF_TIMEOUT", "40"))  # detik menunggu link video
@@ -1356,8 +1361,11 @@ async def process_one(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 await status.edit_text(f"{prefix}🌏 Situs memblokir server Amerika, mencari proxy gratis...")
                 proxies = await asyncio.to_thread(find_free_proxies, host, AUTO_PROXY_TRIES)
                 if not proxies:
-                    blocked.args = ("Situs memblokir server Amerika dan tidak ada proxy gratis yang bisa "
-                                    "dipakai saat ini. Coba lagi nanti, atau isi PROXY_URL.",)
+                    st = FREE_PROXY_STATS
+                    why = ("daftar proxy gratis tidak bisa diambil" if not st["fetched"] else
+                           f"{st['tested']} proxy gratis dicek, tidak ada yang bisa membuka {host}")
+                    blocked.args = (f"Situs memblokir server Amerika, dan {why}. Coba lagi nanti, "
+                                    "atau isi PROXY_URL dengan proxy berbayar.",)
                     raise blocked
                 last = blocked
                 info = None
