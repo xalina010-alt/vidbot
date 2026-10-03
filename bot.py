@@ -393,13 +393,34 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
                 if not pg.is_closed():
                     yield from pg.frames
 
-        def player_url() -> str | None:
+        # Alamat player bisa tertulis di skrip halaman (mis. vidovr: const playerPath = "...stream.php?...").
+        # Tanpa pemblokir iklan, situs memuatnya lewat tab baru / setelah jeda iklan, jadi bot membukanya sendiri.
+        FIND_PLAYER_JS = r"""() => {
+            const h = document.documentElement.innerHTML;
+            const m = h.match(/playerPath\s*=\s*["']([^"']+)["']/);
+            if (m) return m[1].replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
+            const f = document.querySelector('iframe[src*="stream.php"]');
+            return f ? f.src : null;
+        }"""
+        player_notes: list[str] = []
+
+        async def player_url() -> tuple[str | None, str | None]:
+            """(alamat player, referer) atau (None, None) kalau player sudah terbuka / tidak ketemu."""
             if any("/stream.php?" in f.url for f in all_frames()):
-                return None  # player sudah terbuka sebagai frame
+                return None, None  # player sudah terbuka sebagai frame
+            for frame in list(all_frames()):
+                if host not in frame.url:
+                    continue
+                try:
+                    url = await frame.evaluate(FIND_PLAYER_JS)
+                except Exception:
+                    url = None
+                if url and url.startswith("http"):
+                    return url, frame.url
             for c in cands:
                 if "/stream.php?" in c["url"]:
-                    return c["url"]
-            return None
+                    return c["url"], player_referer
+            return None, None
 
         player_referer = page_url
         opened_player = False
@@ -421,18 +442,20 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
                         pass
             # Kalau player belum muncul juga, buka halaman player stream.php langsung
             # (itu yang dilakukan tombol play), dengan referer frame player.
-            if rounds == 4 and not first_hit and not opened_player:
-                url = player_url()
+            if rounds in (2, 4, 7) and not first_hit and not opened_player:
+                url, ref = await player_url()
                 if url:
                     opened_player = True
                     try:
                         pg = await ctx.new_page()
                         keep.append(pg)
-                        await pg.goto(url, referer=player_referer, wait_until="domcontentloaded",
+                        await pg.goto(url, referer=ref or player_referer, wait_until="domcontentloaded",
                                       timeout=30_000)
                         log.info("membuka player langsung: %s", url[:120])
+                        player_notes.append(f"dibuka (putaran {rounds}): {url[:160]}")
                     except Exception as e:
                         log.warning("gagal membuka player: %s", e)
+                        player_notes.append(f"gagal dibuka: {str(e)[:150]}")
             for frame in list(all_frames()):
                 try:
                     for sel in PLAY_SELECTORS:
@@ -490,7 +513,8 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
                     doms.append(f"--- {f.url[:120]}\n(gagal dibaca: {e})")
             own = [s for s in seen if host in s or s.split(" ", 1)[0] in ("media", "other")]
             report = (
-                f"HTTP status: {status}\nJudul: {title}\n\nFrames:\n{frames}\n\n"
+                f"HTTP status: {status}\nJudul: {title}\n\nPlayer: {'; '.join(player_notes) or 'tidak dibuka'}\n\n"
+                f"Frames:\n{frames}\n\n"
                 f"<video> src: {vids or 'tidak ada'}\n\n"
                 f"Request ke {host} / media ({len(own)}):\n" + "\n".join(own[-40:]) + "\n\n"
                 f"Request terakhir ({len(seen)} total):\n" + "\n".join(seen[-40:]) + "\n\n"
