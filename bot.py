@@ -19,6 +19,7 @@ import re
 import shutil
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -64,7 +65,49 @@ USER_AGENT = (
 # Situs yang dikenali (satu player yang sama, beda domain). Tambah domain lain lewat Config Var
 # SITES di Heroku, pisahkan dengan koma, mis. "vidmonstr.com,fiuosba.com,situslain.com".
 SITES = [d.strip().lower().removeprefix("www.") for d in
-         os.environ.get("SITES", "vidmonstr.com,fiuosba.com").split(",") if d.strip()]
+         os.environ.get("SITES", "vidmonstr.com,fiuosba.com,vidovr.com").split(",") if d.strip()]
+# Chromium headless memperkenalkan diri sebagai "HeadlessChrome" lewat header sec-ch-ua walau
+# User-Agent sudah diganti. Server video (mis. overfetch.video di vidovr) memblokirnya dengan 403.
+# Header di bawah menyamakan identitas browser dengan USER_AGENT (Chrome 128 Windows biasa).
+CLIENT_HINTS = {
+    "sec-ch-ua": '"Chromium";v="128", "Google Chrome";v="128", "Not;A=Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+try {
+  const brands = [{brand: 'Chromium', version: '128'}, {brand: 'Google Chrome', version: '128'},
+                  {brand: 'Not;A=Brand', version: '24'}];
+  const uad = navigator.userAgentData;
+  if (uad) Object.defineProperty(navigator, 'userAgentData', {get: () => ({
+    brands, mobile: false, platform: 'Windows',
+    getHighEntropyValues: async () => ({brands, mobile: false, platform: 'Windows',
+      platformVersion: '15.0.0', architecture: 'x86', bitness: '64',
+      uaFullVersion: '128.0.0.0', fullVersionList: brands}),
+    toJSON: () => ({brands, mobile: false, platform: 'Windows'}),
+  })});
+} catch (e) {}
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = window.chrome || {runtime: {}};
+"""
+
+
+def clean_headers(headers: dict) -> dict:
+    """Ganti jejak 'HeadlessChrome' di header salinan dari browser dengan identitas Chrome biasa."""
+    out = {}
+    for k, v in headers.items():
+        lk = k.lower()
+        if lk in CLIENT_HINTS:
+            out[k] = CLIENT_HINTS[lk]
+        elif "headless" in str(v).lower():
+            out[k] = re.sub(r"HeadlessChrome", "Chrome", str(v))
+        else:
+            out[k] = v
+    return out
+
+
 LINK_RE = re.compile(
     r"https?://(?:www\.)?(" + "|".join(re.escape(d) for d in SITES) + r")/(?:e|d)/([A-Za-z0-9]+)",
     re.I,
@@ -276,8 +319,12 @@ async def find_video_url(video_id: str, workdir: Path, host: str = "vidmonstr.co
         log.info("kandidat (%s): %s", how, url[:200])
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
-        ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720})
+        browser = await p.chromium.launch(
+            headless=HEADLESS, args=["--disable-blink-features=AutomationControlled"]
+        )
+        ctx = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 720},
+                                        extra_http_headers=CLIENT_HINTS, locale="en-US")
+        await ctx.add_init_script(STEALTH_JS)
 
         def on_request(req):
             if not SKIP_EXT.search(req.url):
@@ -498,7 +545,7 @@ def cookie_header(cookies: list, url: str) -> str:
 
 def request_headers(info: dict, cookies: list) -> dict:
     """Header untuk mengunduh ulang: pakai header asli browser kalau ada, plus cookie."""
-    headers = dict(info.get("headers") or {})
+    headers = clean_headers(dict(info.get("headers") or {}))
     headers.setdefault("user-agent", USER_AGENT)
     headers.setdefault("referer", info["referer"])
     ck = cookie_header(cookies, info["url"])
@@ -528,6 +575,31 @@ def probe(c: dict, cookies: list) -> tuple[str, str]:
             head = r.read(20000)
             ctype = r.headers.get("content-type", "")
             code = r.status
+    except urllib.error.HTTPError as e:
+        if e.code not in (401, 403):
+            return "error", str(e)[:200]
+        # Ditolak: coba lagi dengan header seminimal mungkin (sebagian CDN menolak header salinan
+        # browser otomatis tapi menerima request biasa dengan referer situsnya).
+        ref = c.get("referer") or ""
+        origin = "{0.scheme}://{0.netloc}/".format(urllib.parse.urlparse(ref)) if ref else ""
+        for referer in dict.fromkeys(x for x in (ref, origin) if x):
+            mini = {"user-agent": USER_AGENT, "referer": referer, "accept": "*/*",
+                    "range": "bytes=0-4095", **CLIENT_HINTS}
+            if origin:
+                mini["origin"] = origin.rstrip("/")
+            try:
+                with urllib.request.urlopen(urllib.request.Request(c["url"], headers=mini), timeout=20) as r:
+                    head = r.read(20000)
+                    ctype = r.headers.get("content-type", "")
+                    code = r.status
+                mini.pop("range", None)
+                c["headers"] = mini  # dipakai juga saat mengunduh
+                c["referer"] = referer
+                break
+            except Exception:
+                continue
+        else:
+            return "error", f"{str(e)[:150]} (juga ditolak dengan header minimal)"
     except Exception as e:
         return "error", str(e)[:200]
     kind = sniff(head[:4096])
